@@ -29,7 +29,7 @@ jobs:
       - name: Validate Compose configurations
         shell: bash
         run: |
-          cp .env.steam-skin-ops.example .env.steam-skin-ops
+          cp config/monitor.example.yaml config/monitor.yaml
           docker compose -f compose.yml config --quiet
           docker compose -f compose.yml -f compose.astrbot.yml config --quiet
 

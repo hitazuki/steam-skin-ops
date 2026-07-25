@@ -5,10 +5,9 @@ __pycache__
 *.pyc
 .env
 .env.*
-config.yaml
+config/*.yaml
 data
 output
 tests
 .vscode
 .idea
-

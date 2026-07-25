@@ -1,17 +1,19 @@
 import unittest
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
 from steam_skin_ops.monitor.api import create_app
+from steam_skin_ops.monitor.config import load_config
 from steam_skin_ops.monitor.events import NotifyResult
 from steam_skin_ops.monitor.integrations.astrbot import AstrBotNotifier
 from steam_skin_ops.monitor.manager import MonitoringManager
 from steam_skin_ops.monitor.market import MarketSnapshot, steam_net_amount
 from steam_skin_ops.monitor.repository import MonitorStorage
+from steam_skin_ops.monitor.runtime import ServiceRuntime
 
 
 ITEM = {
@@ -43,6 +45,7 @@ class FakeSource:
     def __init__(self, ratios=None):
         self.ratios = list(ratios or [0.70])
         self.current_calls = 0
+        self.history_calls = 0
 
     def fetch_metadata(self, smis_id):
         if int(smis_id) != 1579:
@@ -62,6 +65,7 @@ class FakeSource:
         return snapshot(float(ratio), self.current_calls)
 
     def fetch_history(self, item, days):
+        self.history_calls += 1
         result = []
         for index in range(13):
             history = snapshot(0.74, -(index * 12 * 3600))
@@ -184,7 +188,7 @@ class ServiceTestCase(unittest.TestCase):
             version = connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()[0]
-        self.assertEqual(version, "3")
+        self.assertEqual(version, "4")
 
         reopened = MonitorStorage(legacy_path)
         self.assertEqual(reopened.get_rule(1)["recipient_key"], "recipient:a")
@@ -200,6 +204,77 @@ class ServiceTestCase(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "newer than supported"):
             MonitorStorage(path)
+
+    def test_v3_database_migrates_active_breakthrough_level(self):
+        path = Path(self.tmp.name) / "v3.db"
+        storage = MonitorStorage(path)
+        storage.upsert_item(ITEM)
+        rule = storage.add_rule(1579, "umo:a", "ratio", 72)
+        storage.update_rule_state(rule["id"], alert_active=1, last_value=0.67)
+        with storage.connect() as connection:
+            connection.execute("ALTER TABLE rule_states DROP COLUMN highest_notified_level")
+            connection.execute(
+                "UPDATE metadata SET value='3' WHERE key='schema_version'"
+            )
+
+        migrated = MonitorStorage(path)
+        state = migrated.get_rule_state(rule["id"])
+        self.assertEqual(state["highest_notified_level"], 2)
+        MonitoringManager(
+            migrated, FakeSource([0.67]), FakeNotifier(),
+            breakthrough_step_percent=1,
+        )
+        self.assertEqual(
+            migrated.get_rule_state(rule["id"])["highest_notified_level"], 6
+        )
+
+    def test_monitor_yaml_config_loads_nested_settings(self):
+        path = Path(self.tmp.name) / "monitor.yaml"
+        path.write_text("""
+service:
+  token: secret
+  database: ./state.db
+  backup_dir: ./backups
+monitor:
+  interval_seconds: 1800
+  quote_cache_seconds: 90
+  max_items: 10
+alerts:
+  driver: astrbot
+  breakthrough_step_percent: 4
+  daily_summary_time: '08:30'
+smis:
+  timeout_seconds: 12
+  max_retries: 2
+astrbot:
+  base_url: http://astrbot:6185
+  api_key: key
+  message_path: /api/v1/im/message
+  timeout_seconds: 8
+""", encoding="utf-8")
+
+        config = load_config(path)
+
+        self.assertEqual(config.service_token, "secret")
+        self.assertEqual(config.alert_driver, "astrbot")
+        self.assertEqual(config.breakthrough_step_percent, 4)
+        self.assertEqual(config.daily_summary_time, "08:30")
+        self.assertEqual(config.quote_cache_seconds, 90)
+
+    def test_monitor_yaml_config_rejects_missing_token_and_astrbot_key(self):
+        path = Path(self.tmp.name) / "monitor.yaml"
+        path.write_text("service: {}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "service.token"):
+            load_config(path)
+
+        path.write_text("""
+service:
+  token: secret
+alerts:
+  driver: astrbot
+""", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "astrbot.api_key"):
+            load_config(path)
 
     def test_quote_uses_sixty_second_cache(self):
         manager = self.manager([0.70])
@@ -295,6 +370,103 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(self.storage.get_rule_state(second["id"])["alert_active"], 0)
         self.assertEqual(self.storage.get_rule_state(first["id"])["alert_active"], 1)
 
+    def test_rule_fires_on_first_qualifying_cycle(self):
+        notifier = FakeNotifier()
+        manager = self.manager([0.70], notifier)
+        rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
+
+        manager.run_cycle(max_workers=1)
+
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertEqual(self.storage.get_rule_state(rule["id"])["alert_active"], 1)
+
+    def test_breakthrough_levels_are_arithmetic_and_do_not_repeat(self):
+        notifier = FakeNotifier()
+        manager = self.manager([0.72, 0.69, 0.70, 0.66, 0.75, 0.69], notifier)
+        rule = self.storage.add_rule(1579, "umo:a", "ratio", 72)
+
+        manager.run_cycle(max_workers=1)  # initial, level 0
+        manager.run_cycle(max_workers=1)  # level 1
+        manager.run_cycle(max_workers=1)  # back below level 1, no repeat
+        manager.run_cycle(max_workers=1)  # jumps to level 2
+        manager.run_cycle(max_workers=1)  # clears in one cycle
+        manager.run_cycle(max_workers=1)  # new incident
+
+        titles = [message[1] for message in notifier.messages]
+        self.assertEqual(len(titles), 4)
+        self.assertIn("第 1 档", titles[1])
+        self.assertIn("第 2 档", titles[2])
+        self.assertIn("第 1 档", titles[3])
+        self.assertEqual(self.storage.get_rule_state(rule["id"])["highest_notified_level"], 1)
+
+    def test_breakthrough_level_includes_exact_three_percent_boundary(self):
+        manager = self.manager()
+        self.assertEqual(manager._breakthrough_level("ratio", 0.72, 0.6984)[0], 1)
+        self.assertEqual(manager._breakthrough_level("t7", 0.72, 0.6984)[0], 1)
+        self.assertEqual(manager._breakthrough_level("platform", 100, 97)[0], 1)
+        self.assertEqual(manager._breakthrough_level("steam", 100, 106)[0], 2)
+
+    def test_daily_summary_groups_active_rules_once_per_day(self):
+        notifier = FakeNotifier()
+        manager = self.manager([0.70], notifier)
+        self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        self.storage.add_rule(1579, "umo:a", "platform", 3.40)
+        manager.run_cycle(max_workers=1)
+        notifier.messages.clear()
+
+        self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 1)
+        manager.dispatch_outbox()
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertIn("共 2 条", notifier.messages[0][2])
+        self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
+        manager.dispatch_outbox()
+        self.assertEqual(len(notifier.messages), 1)
+
+    def test_empty_daily_check_prevents_later_same_day_summary(self):
+        manager = self.manager([0.70])
+        self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
+        self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        manager.run_cycle(max_workers=1)
+        self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
+
+    def test_daily_summary_excludes_recovery_band_and_missing_values(self):
+        manager = self.manager()
+        recovery = self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        missing = self.storage.add_rule(1579, "umo:a", "platform", 3.40)
+        self.storage.update_rule_state(
+            recovery["id"], alert_active=1, last_value=0.73
+        )
+        self.storage.update_rule_state(
+            missing["id"], alert_active=1, last_value=None
+        )
+
+        self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
+
+    def test_runtime_sends_summary_at_first_cycle_after_beijing_nine(self):
+        notifier = FakeNotifier()
+        manager = self.manager([0.70], notifier)
+        self.storage.add_rule(1579, "umo:a", "ratio", 72)
+        runtime = ServiceRuntime(
+            manager, backup_dir=Path(self.tmp.name) / "backups",
+            daily_summary_time="09:00",
+        )
+
+        runtime.run_once(datetime(2026, 7, 25, 0, 30, tzinfo=timezone.utc))
+        notifier.messages.clear()
+        runtime.run_once(datetime(2026, 7, 25, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertIn("每日交易告警汇总", notifier.messages[0][1])
+
+    def test_breakthrough_step_and_daily_time_are_validated(self):
+        with self.assertRaisesRegex(ValueError, "突破档位步长"):
+            MonitoringManager(
+                self.storage, FakeSource(), FakeNotifier(),
+                breakthrough_step_percent=0,
+            )
+        with self.assertRaisesRegex(ValueError, "HH:MM"):
+            ServiceRuntime(self.manager(), daily_summary_time="9am")
+
     def test_lowest_platform_ignores_liquidity(self):
         value = snapshot()
         value = MarketSnapshot(**{
@@ -383,6 +555,9 @@ class ServiceTestCase(unittest.TestCase):
                 params={"recipient_key": "astrQQ:FriendMessage:test"},
             )
             self.assertEqual(listed.json()["data"][0]["rule_type"], "ratio")
+            self.assertIn(
+                "highest_notified_level", listed.json()["data"][0]["state"]
+            )
             quote_response = client.get(
                 "/v2/market/quote", headers=headers, params={"q": "1579"}
             )
@@ -432,6 +607,29 @@ class ServiceTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["data"]["smis_id"], 1579)
         self.assertEqual(len(response.json()["data"]["points"]), 13)
+        with self.storage.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_snapshot_pruning_keeps_only_rolling_eight_days(self):
+        old = snapshot(0.70, -(9 * 86400))
+        recent = snapshot(0.71, -(7 * 86400))
+        self.storage.save_snapshots([old, recent])
+
+        self.assertEqual(self.storage.prune_snapshots(retain_days=8), 1)
+        with self.storage.connect() as connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM market_snapshots"
+            ).fetchone()[0]
+        self.assertEqual(remaining, 1)
+
+    def test_history_backfill_only_runs_when_local_coverage_is_insufficient(self):
+        manager = self.manager()
+        item = dict(ITEM)
+        manager._ensure_history(item)
+        self.assertEqual(manager.source.history_calls, 1)
+        manager._ensure_history(item)
+        self.assertEqual(manager.source.history_calls, 1)
 
     def test_adding_same_rule_updates_existing_rule_and_resets_state(self):
         manager = self.manager()

@@ -4,13 +4,13 @@
 ====================
 通过 Chrome 远程调试协议（CDP）从浏览器中提取
 buff.163.com 和 steamcommunity.com 的登录凭证，
-写入 config.yaml。
+写入 config/profit.yaml。
 
 使用方法：
 1. 关闭所有 Chrome 窗口
 2. 运行本脚本（会自动以调试模式启动 Chrome）
 3. 在自动打开的 Chrome 中确认已登录 BUFF 和 Steam
-4. 回到本窗口按 Enter，脚本自动提取并写入 config.yaml
+4. 回到本窗口按 Enter，脚本自动提取并写入 config/profit.yaml
 
 完全在本机运行，不经过任何网络或 AI 中转。
 
@@ -249,9 +249,9 @@ def write_config(config_path: Path, buff_session: str, steam_session_id: str,
     if not config_path.exists():
         if example_path.exists():
             shutil.copy2(example_path, config_path)
-            print("[OK] 已从模板创建 config.yaml")
+            print(f"[OK] 已从模板创建 {config_path}")
         else:
-            print("[错误] config.example.yaml 不存在")
+            print("[错误] config/profit.example.yaml 不存在")
             return
 
     with open(config_path, encoding="utf-8") as f:

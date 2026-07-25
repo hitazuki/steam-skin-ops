@@ -35,10 +35,10 @@ python -m steam_skin_ops.profit view
 
 ## 独立行情与监控服务
 
-复制环境文件并启动：
+复制监控配置并启动：
 
 ```bash
-copy .env.steam-skin-ops.example .env.steam-skin-ops
+copy config\monitor.example.yaml config\monitor.yaml
 docker compose up -d
 ```
 
@@ -72,8 +72,20 @@ GET  /healthz
 - `platform`：最低第三方平台价达到买入目标。
 - `steam`：Steam 展示售价达到库存清理目标。
 
-规则连续两轮满足才产生一次事件；解除条件连续两轮越过 3% 回差后重新布防。
-默认每 30 分钟轮询，真实请求连续失败三轮才生成异常事件。
+规则首次满足即产生事件；继续向有利方向变化时，每相对原阈值突破 3% 通知一次，
+一次跨越多档只通知当前最高档。越过 3% 恢复回差后立即重新布防，不发送恢复通知。
+每天北京时间 09:00 汇总仍满足原始阈值的活跃规则。
+
+默认每 30 分钟轮询，真实请求连续失败三轮才生成异常事件。行情快照仅滚动保留
+8 天，用于 T+7 统计和最新报价缓存；历史查询接口仍直接读取 SMIS。
+
+监控参数统一位于 `config/monitor.yaml`，例如：
+
+```yaml
+alerts:
+  breakthrough_step_percent: 3
+  daily_summary_time: "09:00"
+```
 
 ## AstrBot 集成
 
@@ -89,7 +101,7 @@ docker compose -f compose.yml -f compose.astrbot.yml up -d
 
 ```text
 service_base_url=http://steam-skin-ops:8080
-service_token=<与 STEAM_SKIN_OPS_SERVICE_TOKEN 相同>
+service_token=<与 config/monitor.yaml 的 service.token 相同>
 ```
 
 插件提供 `/skin search`、`quote`、`rule`、`items`、`test`、`status`、`help`。
@@ -108,11 +120,12 @@ python -m unittest discover -s tests -v
 收益模块。提交与 PR 标题必须遵循根目录 [AGENTS.md](AGENTS.md) 中带 scope 的
 Conventional Commits。
 
-## v3 破坏性变更
+## 破坏性变更
 
 - 项目由 `buff2steam` 更名为 `steam-skin-ops`。
 - Python 包改为 `steam_skin_ops`，不保留 `python src/main.py`。
-- 监控环境变量改为 `STEAM_SKIN_OPS_*`。
+- 收益和监控配置统一放在 `config/`；监控服务只读取
+  `config/monitor.yaml`，不再读取旧环境变量。
 - HTTP API 直接升级为 `/v2`，接收者字段由 `umo` 改为 `recipient_key`。
 - AstrBot 插件 ID 改为 `astrbot_plugin_steam_skin_ops`。
 - SQLite 启动时自动迁移规则接收者和告警事件，部署前仍必须备份数据库。

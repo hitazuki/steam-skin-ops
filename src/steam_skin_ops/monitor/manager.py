@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -45,9 +47,10 @@ class MonitoringManager:
         *,
         max_items: int = 20,
         quote_cache_seconds: int = 60,
-        confirmations: int = 2,
-        clear_confirmations: int = 2,
+        confirmations: int = 1,
+        clear_confirmations: int = 1,
         health_failure_threshold: int = 3,
+        breakthrough_step_percent: float = 3,
     ) -> None:
         self.storage = storage
         self.source = source
@@ -57,8 +60,31 @@ class MonitoringManager:
         self.confirmations = confirmations
         self.clear_confirmations = clear_confirmations
         self.health_failure_threshold = health_failure_threshold
+        if not math.isfinite(breakthrough_step_percent) or breakthrough_step_percent <= 0:
+            raise ValueError("突破档位步长必须大于 0")
+        self.breakthrough_step = float(breakthrough_step_percent) / 100
         self._locks_guard = threading.Lock()
         self._item_locks: dict[int, threading.Lock] = {}
+        self._sync_breakthrough_step()
+
+    def _sync_breakthrough_step(self) -> None:
+        key = "alerting:breakthrough_step"
+        value = f"{self.breakthrough_step:.12g}"
+        if self.storage.get_metadata(key) == value:
+            return
+        for rule in self.storage.list_rules():
+            state = self.storage.get_rule_state(int(rule["id"]))
+            current = state.get("last_value")
+            if not state.get("alert_active") or current is None:
+                continue
+            rule_type = str(rule["rule_type"])
+            threshold = float(rule["threshold"])
+            limit = threshold / 100 if rule_type in {"ratio", "t7"} else threshold
+            level, _ = self._breakthrough_level(rule_type, limit, float(current))
+            self.storage.update_rule_state(
+                int(rule["id"]), highest_notified_level=level
+            )
+        self.storage.set_metadata(key, value)
 
     def _lock_for(self, smis_id: int) -> threading.Lock:
         with self._locks_guard:
@@ -303,12 +329,21 @@ class MonitoringManager:
         }
 
     def _ensure_history(self, item: dict) -> None:
-        key = f"rule_history_backfill:v1:{item['item_key']}:7"
-        if self.storage.get_metadata(key) == "complete":
+        rows = self.storage.steam_history(item["item_key"], days=7)
+        if not self._history_needs_backfill(rows):
             return
         snapshots = self.source.fetch_history(item, 7)
         self.storage.save_snapshots(snapshots)
-        self.storage.set_metadata(key, "complete")
+
+    @staticmethod
+    def _history_needs_backfill(rows: list[dict]) -> bool:
+        if len(rows) < 12:
+            return True
+        first = datetime.fromisoformat(str(rows[0]["source_updated_at"]))
+        last = datetime.fromisoformat(str(rows[-1]["source_updated_at"]))
+        span_days = (last - first).total_seconds() / 86400
+        age_hours = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+        return span_days < 5.5 or age_hours > 6
 
     def _t7_stats(self, item_key: str) -> dict:
         return t7_stats(self.storage.steam_history(item_key, days=7))
@@ -358,7 +393,15 @@ class MonitoringManager:
             qualifying = int(state["qualifying_count"]) + 1 if qualifies else 0
             changes.update({"qualifying_count": qualifying, "clearing_count": 0})
             if qualifying >= self.confirmations:
-                title, content = self._format_rule_alert(snapshot, stats, rule, value)
+                initial_level, initial_depth = self._breakthrough_level(
+                    rule_type, limit, value
+                )
+                if initial_level > 0:
+                    title, content = self._format_breakthrough_alert(
+                        snapshot, rule, value, initial_depth, initial_level
+                    )
+                else:
+                    title, content = self._format_rule_alert(snapshot, stats, rule, value)
                 signal = f"rule:{rule_id}:{observed}"
                 self.storage.enqueue_notification(
                     signal, str(rule["recipient_key"]), f"rule_{rule_type}", title, content,
@@ -367,6 +410,7 @@ class MonitoringManager:
                 changes.update({
                     "alert_active": 1, "qualifying_count": qualifying,
                     "last_signal_at": observed,
+                    "highest_notified_level": initial_level,
                 })
         else:
             clear_boundary = limit * (0.97 if rule_type == "steam" else 1.03)
@@ -374,8 +418,108 @@ class MonitoringManager:
             clearing = int(state["clearing_count"]) + 1 if clears else 0
             changes.update({"qualifying_count": 0, "clearing_count": clearing})
             if clearing >= self.clear_confirmations:
-                changes.update({"alert_active": 0, "clearing_count": 0})
+                changes.update({
+                    "alert_active": 0, "clearing_count": 0,
+                    "highest_notified_level": 0,
+                })
+            elif qualifies:
+                level, depth = self._breakthrough_level(rule_type, limit, value)
+                if level > int(state["highest_notified_level"]):
+                    title, content = self._format_breakthrough_alert(
+                        snapshot, rule, value, depth, level
+                    )
+                    self.storage.enqueue_notification(
+                        f"rule:{rule_id}:breakthrough:{level}:{observed}",
+                        str(rule["recipient_key"]), "rule_breakthrough", title, content,
+                        driver=self.notifier.name, rule_id=rule_id,
+                    )
+                    changes.update({
+                        "highest_notified_level": level,
+                        "last_signal_at": observed,
+                    })
         self.storage.update_rule_state(rule_id, **changes)
+
+    def _breakthrough_level(
+        self, rule_type: str, limit: float, value: float
+    ) -> tuple[int, float]:
+        depth = (
+            (value - limit) / limit
+            if rule_type == "steam"
+            else (limit - value) / limit
+        )
+        depth = max(0.0, depth)
+        return math.floor((depth + 1e-12) / self.breakthrough_step), depth
+
+    @staticmethod
+    def _format_breakthrough_alert(
+        snapshot: MarketSnapshot, rule: dict, value: float, depth: float, level: int
+    ) -> tuple[str, str]:
+        rule_type = str(rule["rule_type"])
+        labels = {
+            "ratio": "即时比例", "t7": "T+7 保守比例",
+            "platform": "最低平台价", "steam": "Steam 售价",
+        }
+        value_text = f"{value:.2%}" if rule_type in {"ratio", "t7"} else f"¥{value:.2f}"
+        threshold = float(rule["threshold"])
+        threshold_text = (
+            f"{threshold:.2f}%" if rule_type in {"ratio", "t7"} else f"¥{threshold:.2f}"
+        )
+        content = "\n".join([
+            f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
+            f"{labels[rule_type]}：{value_text}（阈值 {threshold_text}）",
+            f"相对阈值继续突破：{depth:.2%}，达到第 {level} 档",
+            f"数据更新时间：{snapshot.source_updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+            f"SMIS：https://smis.club/detail/{snapshot.smis_id}",
+        ])
+        return f"【继续突破·第 {level} 档】{snapshot.name_zh} {value_text}", content
+
+    def enqueue_daily_summary(self, summary_date: date) -> int:
+        date_text = summary_date.isoformat()
+        key = "daily_summary:last_date"
+        if self.storage.get_metadata(key) == date_text:
+            return 0
+
+        grouped: dict[str, list[tuple[dict, dict, int, float]]] = defaultdict(list)
+        for rule in self.storage.list_rules():
+            state = self.storage.get_rule_state(int(rule["id"]))
+            value = state.get("last_value")
+            if not state.get("alert_active") or value is None:
+                continue
+            rule_type = str(rule["rule_type"])
+            threshold = float(rule["threshold"])
+            limit = threshold / 100 if rule_type in {"ratio", "t7"} else threshold
+            qualifies = float(value) >= limit if rule_type == "steam" else float(value) <= limit
+            if not qualifies:
+                continue
+            level, depth = self._breakthrough_level(rule_type, limit, float(value))
+            grouped[str(rule["recipient_key"])].append((rule, state, level, depth))
+
+        queued = 0
+        labels = {
+            "ratio": "即时比例", "t7": "T+7 比例",
+            "platform": "平台价", "steam": "Steam 价",
+        }
+        for recipient_key, entries in sorted(grouped.items()):
+            lines = [f"当前仍满足条件的交易告警共 {len(entries)} 条："]
+            for rule, state, level, depth in entries:
+                rule_type = str(rule["rule_type"])
+                value = float(state["last_value"])
+                threshold = float(rule["threshold"])
+                if rule_type in {"ratio", "t7"}:
+                    values = f"{value:.2%} / 阈值 {threshold:.2f}%"
+                else:
+                    values = f"¥{value:.2f} / 阈值 ¥{threshold:.2f}"
+                lines.append(
+                    f"#{int(rule['id'])} {rule['cn_name']} · {labels[rule_type]} "
+                    f"{values} · 第 {level} 档（{depth:.2%}）"
+                )
+            queued += int(self.storage.enqueue_notification(
+                f"daily-summary:{date_text}", recipient_key, "daily_summary",
+                f"【每日交易告警汇总】{date_text}", "\n".join(lines),
+                driver=self.notifier.name,
+            ))
+        self.storage.set_metadata(key, date_text)
+        return queued
 
     def _handle_item_failure(self, item: dict, rules: list[dict], exc: Exception) -> None:
         for recipient_key in sorted({str(rule["recipient_key"]) for rule in rules}):

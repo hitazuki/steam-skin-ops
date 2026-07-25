@@ -3,22 +3,11 @@ services:
     image: docker.io/hitazuki/steam-skin-ops:latest
     container_name: steam-skin-ops
     restart: unless-stopped
-    env_file:
-      - .env.steam-skin-ops
-    environment:
-      STEAM_SKIN_OPS_ALERT_DRIVER: store
-      STEAM_SKIN_OPS_DATABASE: /app/data/monitor.db
-      STEAM_SKIN_OPS_BACKUP_DIR: /app/data/backups
-      STEAM_SKIN_OPS_INTERVAL_SECONDS: "1800"
-      STEAM_SKIN_OPS_QUOTE_CACHE_SECONDS: "60"
-      STEAM_SKIN_OPS_MAX_ITEMS: "20"
-      SMIS_TIMEOUT_SECONDS: "15"
-      SMIS_MAX_RETRIES: "3"
-      TZ: Asia/Shanghai
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./data:/app/data
+      - ./config/monitor.yaml:/app/config/monitor.yaml:ro
     mem_limit: 512m
     cpus: 0.50
     logging:

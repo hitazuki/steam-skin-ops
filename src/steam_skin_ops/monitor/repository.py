@@ -9,7 +9,8 @@ from typing import Any, Iterator
 from .market import MarketSnapshot
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+DEFAULT_BREAKTHROUGH_STEP = 0.03
 
 
 DEFAULT_STATE = {
@@ -31,6 +32,7 @@ DEFAULT_RULE_STATE = {
     "last_baseline": None,
     "last_observed_at": None,
     "last_signal_at": None,
+    "highest_notified_level": 0,
     "status": "waiting",
 }
 
@@ -166,6 +168,7 @@ class MonitorStorage:
                     last_baseline REAL,
                     last_observed_at TEXT,
                     last_signal_at TEXT,
+                    highest_notified_level INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'waiting',
                     updated_at TEXT NOT NULL
                 );
@@ -187,8 +190,10 @@ class MonitorStorage:
                     f"database schema v{current_version} is newer than supported "
                     f"v{SCHEMA_VERSION}"
                 )
-            if current_version < SCHEMA_VERSION:
+            if current_version < 3:
                 self._migrate_v3(conn)
+            if current_version < 4:
+                self._migrate_v4(conn)
 
     def _migrate_v3(self, conn: sqlite3.Connection) -> None:
         """Transactionally migrate v2 recipient and notification tables."""
@@ -249,11 +254,55 @@ class MonitorStorage:
                 INSERT INTO metadata(key,value,updated_at) VALUES('schema_version',?,?)
                 ON CONFLICT(key) DO UPDATE SET
                     value=excluded.value, updated_at=excluded.updated_at
-            """, (str(SCHEMA_VERSION), now))
+            """, ("3", now))
             conn.execute("RELEASE SAVEPOINT migrate_v3")
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT migrate_v3")
             conn.execute("RELEASE SAVEPOINT migrate_v3")
+            raise
+
+    def _migrate_v4(self, conn: sqlite3.Connection) -> None:
+        """Add persisted breakthrough levels without replaying old alerts."""
+        conn.execute("SAVEPOINT migrate_v4")
+        try:
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(rule_states)")
+            }
+            if "highest_notified_level" not in columns:
+                conn.execute(
+                    "ALTER TABLE rule_states ADD COLUMN "
+                    "highest_notified_level INTEGER NOT NULL DEFAULT 0"
+                )
+
+            rows = conn.execute("""
+                SELECT s.rule_id,s.last_value,r.rule_type,r.threshold
+                FROM rule_states s JOIN rules r ON r.id=s.rule_id
+                WHERE s.alert_active=1 AND s.last_value IS NOT NULL
+            """).fetchall()
+            for row in rows:
+                value = float(row["last_value"])
+                threshold = float(row["threshold"])
+                limit = threshold / 100 if row["rule_type"] in {"ratio", "t7"} else threshold
+                depth = (
+                    (value - limit) / limit
+                    if row["rule_type"] == "steam"
+                    else (limit - value) / limit
+                )
+                level = max(0, int((max(0.0, depth) + 1e-12) / DEFAULT_BREAKTHROUGH_STEP))
+                conn.execute(
+                    "UPDATE rule_states SET highest_notified_level=? WHERE rule_id=?",
+                    (level, int(row["rule_id"])),
+                )
+
+            now = self._utcnow()
+            conn.execute("""
+                INSERT INTO metadata(key,value,updated_at) VALUES('schema_version','4',?)
+                ON CONFLICT(key) DO UPDATE SET value='4',updated_at=excluded.updated_at
+            """, (now,))
+            conn.execute("RELEASE SAVEPOINT migrate_v4")
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT migrate_v4")
+            conn.execute("RELEASE SAVEPOINT migrate_v4")
             raise
 
     @staticmethod
@@ -477,8 +526,9 @@ class MonitorStorage:
             conn.execute("""
                 INSERT INTO rule_states(
                     rule_id,alert_active,qualifying_count,clearing_count,last_value,
-                    last_baseline,last_observed_at,last_signal_at,status,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    last_baseline,last_observed_at,last_signal_at,
+                    highest_notified_level,status,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(rule_id) DO UPDATE SET
                     alert_active=excluded.alert_active,
                     qualifying_count=excluded.qualifying_count,
@@ -487,11 +537,13 @@ class MonitorStorage:
                     last_baseline=excluded.last_baseline,
                     last_observed_at=excluded.last_observed_at,
                     last_signal_at=excluded.last_signal_at,
+                    highest_notified_level=excluded.highest_notified_level,
                     status=excluded.status,updated_at=excluded.updated_at
             """, (
                 int(rule_id), int(state["alert_active"]), int(state["qualifying_count"]),
                 int(state["clearing_count"]), state["last_value"], state["last_baseline"],
-                state["last_observed_at"], state["last_signal_at"], state["status"], now,
+                state["last_observed_at"], state["last_signal_at"],
+                int(state["highest_notified_level"]), state["status"], now,
             ))
         return self.get_rule_state(rule_id)
 
@@ -675,6 +727,16 @@ class MonitorStorage:
             {"source_updated_at": key, "steam_sell_price": value}
             for key, value in sorted(deduped.items())
         ]
+
+    def prune_snapshots(self, retain_days: int = 8) -> int:
+        from datetime import timedelta
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=int(retain_days))).isoformat()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM market_snapshots WHERE source_updated_at<?", (cutoff,)
+            )
+            return int(cursor.rowcount)
 
     def get_metadata(self, key: str) -> str | None:
         with self.connect() as conn:

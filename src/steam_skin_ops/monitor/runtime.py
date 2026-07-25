@@ -4,6 +4,7 @@ import logging
 import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .manager import MonitoringManager
 
@@ -14,10 +15,17 @@ class ServiceRuntime:
     def __init__(
         self, manager: MonitoringManager, interval_seconds: int = 1800,
         backup_dir: Path = Path("./data/backups"),
+        daily_summary_time: str = "09:00",
     ) -> None:
         self.manager = manager
         self.interval_seconds = max(1, interval_seconds)
         self.backup_dir = Path(backup_dir)
+        try:
+            parsed = datetime.strptime(daily_summary_time, "%H:%M")
+        except ValueError as exc:
+            raise ValueError("每日报告时间必须使用 HH:MM 格式") from exc
+        self.daily_summary_minutes = parsed.hour * 60 + parsed.minute
+        self.local_timezone = ZoneInfo("Asia/Shanghai")
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.started_at: str | None = None
@@ -41,13 +49,7 @@ class ServiceRuntime:
     def _run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                results = self.manager.run_cycle()
-                self.last_cycle_ok = all(result.get("success", True) for result in results)
-                self.last_error = None
-                today = datetime.now().date()
-                if self.last_backup_date != today:
-                    self.manager.backup(self.backup_dir)
-                    self.last_backup_date = today
+                self.run_once()
             except Exception as exc:
                 self.last_cycle_ok = False
                 self.last_error = str(exc)
@@ -55,6 +57,25 @@ class ServiceRuntime:
             finally:
                 self.last_cycle_at = datetime.now(timezone.utc).isoformat()
             self.stop_event.wait(self.interval_seconds)
+
+    def run_once(self, now: datetime | None = None) -> list[dict]:
+        results = self.manager.run_cycle()
+        self.last_cycle_ok = all(result.get("success", True) for result in results)
+        self.last_error = None
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise ValueError("运行时间必须包含时区")
+        now_local = current.astimezone(self.local_timezone)
+        today = now_local.date()
+        minute_of_day = now_local.hour * 60 + now_local.minute
+        if minute_of_day >= self.daily_summary_minutes:
+            self.manager.enqueue_daily_summary(today)
+            self.manager.dispatch_outbox()
+        if self.last_backup_date != today:
+            self.manager.storage.prune_snapshots(retain_days=8)
+            self.manager.backup(self.backup_dir)
+            self.last_backup_date = today
+        return results
 
     def status(self) -> dict:
         return {

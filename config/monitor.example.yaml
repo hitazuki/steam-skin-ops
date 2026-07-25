@@ -1,0 +1,31 @@
+# ============================================================
+# Steam Skin Ops 行情监控配置模板
+# 复制此文件为 config/monitor.yaml 并填写真实 Token/API Key
+# config/monitor.yaml 已被 .gitignore，不会被提交
+# ============================================================
+
+service:
+  token: "replace_with_a_long_random_token"
+  database: "./data/monitor.db"
+  backup_dir: "./data/backups"
+
+monitor:
+  interval_seconds: 1800       # 上游行情轮询间隔，默认 30 分钟
+  quote_cache_seconds: 60
+  max_items: 20
+
+alerts:
+  driver: "store"             # store 或 astrbot
+  breakthrough_step_percent: 3
+  daily_summary_time: "09:00" # Asia/Shanghai
+
+smis:
+  timeout_seconds: 15
+  max_retries: 3
+
+astrbot:
+  # alerts.driver=astrbot 时使用
+  base_url: "http://astrbot:6185"
+  api_key: ""
+  message_path: "/api/v1/im/message"
+  timeout_seconds: 10

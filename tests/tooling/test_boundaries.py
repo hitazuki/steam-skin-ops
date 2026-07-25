@@ -27,11 +27,18 @@ class BoundaryTestCase(unittest.TestCase):
 
     def test_dockerfile_copies_only_monitor_runtime(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("src/steam_skin_ops/monitor", dockerfile)
         self.assertNotIn("src/steam_skin_ops/profit", dockerfile)
+        self.assertIn("steam_skin_ops.monitor.api:create_app", dockerfile)
+        self.assertIn("--factory", dockerfile)
+        self.assertIn("config/*.yaml", dockerignore)
 
     def test_standalone_compose_has_no_astrbot_dependency(self):
         standalone = (ROOT / "compose.yml").read_text(encoding="utf-8")
         overlay = (ROOT / "compose.astrbot.yml").read_text(encoding="utf-8")
         self.assertNotIn("astrbot-internal", standalone)
         self.assertIn("astrbot-internal", overlay)
+        self.assertIn("config/monitor.yaml:/app/config/monitor.yaml:ro", standalone)
+        self.assertNotIn("env_file", standalone)
+        self.assertNotIn("environment:", standalone)

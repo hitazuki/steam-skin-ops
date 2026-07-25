@@ -1,10 +1,5 @@
 services:
   steam-skin-ops:
-    environment:
-      STEAM_SKIN_OPS_ALERT_DRIVER: astrbot
-      ASTRBOT_BASE_URL: http://astrbot:6185
-      ASTRBOT_MESSAGE_PATH: /api/v1/im/message
-      ASTRBOT_TIMEOUT_SECONDS: "10"
     networks:
       - default
       - astrbot-internal

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,6 +15,7 @@ from pydantic import BaseModel, Field
 from steam_skin_ops import __version__
 
 from .events import StoreAlertDriver
+from .config import DEFAULT_CONFIG, MonitorConfig, load_config
 from .integrations.astrbot import AstrBotNotifier
 from .integrations.smis import SmisClient
 from .manager import MonitoringManager, ServiceError
@@ -50,38 +50,45 @@ def create_app(
     manager: MonitoringManager | None = None,
     runtime: ServiceRuntime | None = None,
     service_token: str | None = None,
+    config: MonitorConfig | None = None,
+    config_path: str | Path = DEFAULT_CONFIG,
 ) -> FastAPI:
-    token = service_token if service_token is not None else os.getenv(
-        "STEAM_SKIN_OPS_SERVICE_TOKEN", ""
-    )
+    settings = config
+    if settings is None and (
+        service_token is None or manager is None or runtime is None
+    ):
+        settings = load_config(config_path)
+    token = service_token if service_token is not None else settings.service_token
     if manager is None:
-        driver_name = os.getenv("STEAM_SKIN_OPS_ALERT_DRIVER", "store").strip().lower()
+        driver_name = settings.alert_driver
         if driver_name == "store":
             driver = StoreAlertDriver()
         elif driver_name == "astrbot":
             driver = AstrBotNotifier(
-                os.getenv("ASTRBOT_BASE_URL", "http://astrbot:6185"),
-                os.getenv("ASTRBOT_API_KEY", ""),
-                os.getenv("ASTRBOT_MESSAGE_PATH", "/api/v1/im/message"),
-                float(os.getenv("ASTRBOT_TIMEOUT_SECONDS", "10")),
+                settings.astrbot_base_url,
+                settings.astrbot_api_key,
+                settings.astrbot_message_path,
+                settings.astrbot_timeout_seconds,
             )
         else:
-            raise RuntimeError("STEAM_SKIN_OPS_ALERT_DRIVER 必须是 store 或 astrbot")
+            raise RuntimeError("alerts.driver 必须是 store 或 astrbot")
         manager = MonitoringManager(
-            MonitorStorage(Path(os.getenv("STEAM_SKIN_OPS_DATABASE", "./data/monitor.db"))),
+            MonitorStorage(settings.database),
             SmisClient(
-                timeout=float(os.getenv("SMIS_TIMEOUT_SECONDS", "15")),
-                max_retries=int(os.getenv("SMIS_MAX_RETRIES", "3")),
+                timeout=settings.smis_timeout_seconds,
+                max_retries=settings.smis_max_retries,
             ),
             driver,
-            max_items=int(os.getenv("STEAM_SKIN_OPS_MAX_ITEMS", "20")),
-            quote_cache_seconds=int(os.getenv("STEAM_SKIN_OPS_QUOTE_CACHE_SECONDS", "60")),
+            max_items=settings.max_items,
+            quote_cache_seconds=settings.quote_cache_seconds,
+            breakthrough_step_percent=settings.breakthrough_step_percent,
         )
     if runtime is None:
         runtime = ServiceRuntime(
             manager,
-            interval_seconds=int(os.getenv("STEAM_SKIN_OPS_INTERVAL_SECONDS", "1800")),
-            backup_dir=Path(os.getenv("STEAM_SKIN_OPS_BACKUP_DIR", "./data/backups")),
+            interval_seconds=settings.interval_seconds,
+            backup_dir=settings.backup_dir,
+            daily_summary_time=settings.daily_summary_time,
         )
 
     async def require_token(
@@ -215,6 +222,3 @@ def create_app(
         return ok({"version": __version__, **runtime.status()})
 
     return app
-
-
-app = create_app()

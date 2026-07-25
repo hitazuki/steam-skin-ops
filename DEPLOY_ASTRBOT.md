@@ -5,16 +5,20 @@
 ```bash
 mkdir -p /home/ubuntu/steam-skin-ops
 cd /home/ubuntu/steam-skin-ops
-cp .env.steam-skin-ops.example .env.steam-skin-ops
+cp config/monitor.example.yaml config/monitor.yaml
 docker network create astrbot-internal || true
 sudo docker compose -f compose.yml -f compose.astrbot.yml up -d
 ```
 
-`.env.steam-skin-ops` 必须配置：
+`config/monitor.yaml` 必须配置：
 
-```text
-STEAM_SKIN_OPS_SERVICE_TOKEN=<随机长字符串>
-ASTRBOT_API_KEY=<仅含 im 权限的 AstrBot Key>
+```yaml
+service:
+  token: "<随机长字符串>"
+alerts:
+  driver: "astrbot"
+astrbot:
+  api_key: "<仅含 im 权限的 AstrBot Key>"
 ```
 
 AstrBot Compose 必须持久加入 `astrbot-internal`，不能只执行一次
@@ -48,8 +52,8 @@ sudo docker restart astrbot
    mv /home/ubuntu/buff2steam /home/ubuntu/steam-skin-ops
    ```
 
-3. 替换 Compose 和环境文件，将旧 Token/Key 写入新变量；不要保留
-   `BUFF2STEAM_*`。
+3. 替换 Compose 并创建 `config/monitor.yaml`，将旧 Token/Key 写入对应
+   YAML 字段；旧环境变量不再生效。
 
 4. 备份并移除旧插件，避免两个插件同时注册 `/skin`：
 

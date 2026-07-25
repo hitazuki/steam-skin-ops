@@ -247,7 +247,9 @@ class BuffClient:
                 username = data.get("data", {}).get("nickname", "未知")
                 logger.info("[BUFF] 登录成功，用户：%s", username)
                 return True
-            logger.error("[BUFF] Cookie 无效或已过期，请更新 config.yaml 中的 buff.cookie")
+            logger.error(
+                "[BUFF] Cookie 无效或已过期，请更新 config/profit.yaml 中的 buff.cookie"
+            )
             return False
         except Exception as e:
             logger.error("[BUFF] 登录检查失败: %s", e)

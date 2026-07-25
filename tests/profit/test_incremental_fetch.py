@@ -38,7 +38,7 @@ class TestCommandParser(unittest.TestCase):
 
     def test_check_login_only_checks_selected_platform(self):
         with TemporaryDirectory() as directory:
-            config = Path(directory) / "config.yaml"
+            config = Path(directory) / "profit.yaml"
             config.write_text("buff: {}\nsteam: {}\nc5: {enabled: false}\n", encoding="utf-8")
             with (
                 patch.object(BuffClient, "check_login", return_value=True) as buff_check,
@@ -55,7 +55,7 @@ class TestCommandParser(unittest.TestCase):
             data_dir.mkdir()
             (data_dir / "buff_csgo_orders.json").write_text("[]", encoding="utf-8")
             (data_dir / "steam_sales.json").write_text("[]", encoding="utf-8")
-            config = root / "config.yaml"
+            config = root / "profit.yaml"
             config.write_text(
                 "buff: {}\nsteam: {}\nc5: {enabled: false}\nsettings:\n"
                 f"  data_dir: '{data_dir.as_posix()}'\n"
@@ -91,7 +91,7 @@ class TestCommandParser(unittest.TestCase):
             data_dir.mkdir()
             (data_dir / "buff_csgo_orders.json").write_text("[]", encoding="utf-8")
             (data_dir / "steam_sales.json").write_text("[]", encoding="utf-8")
-            config = root / "config.yaml"
+            config = root / "profit.yaml"
             config.write_text(
                 "buff:\n"
                 "  games: [csgo]\n"
@@ -119,7 +119,7 @@ class TestCommandParser(unittest.TestCase):
             data_dir.mkdir()
             (data_dir / "buff_csgo_orders.json").write_text("[]", encoding="utf-8")
             (data_dir / "steam_sales.json").write_text("[]", encoding="utf-8")
-            config = root / "config.yaml"
+            config = root / "profit.yaml"
             config.write_text(
                 "buff:\n"
                 "  games: [csgo]\n"
