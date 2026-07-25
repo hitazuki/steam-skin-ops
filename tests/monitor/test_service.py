@@ -246,6 +246,7 @@ alerts:
 smis:
   timeout_seconds: 12
   max_retries: 2
+  min_request_interval_seconds: 1.5
 astrbot:
   base_url: http://astrbot:6185
   api_key: key
@@ -260,6 +261,7 @@ astrbot:
         self.assertEqual(config.breakthrough_step_percent, 4)
         self.assertEqual(config.daily_summary_time, "08:30")
         self.assertEqual(config.quote_cache_seconds, 90)
+        self.assertEqual(config.smis_min_request_interval_seconds, 1.5)
 
     def test_monitor_yaml_config_rejects_missing_token_and_astrbot_key(self):
         path = Path(self.tmp.name) / "monitor.yaml"
@@ -397,6 +399,12 @@ alerts:
         self.assertIn("第 1 档", titles[1])
         self.assertIn("第 2 档", titles[2])
         self.assertIn("第 1 档", titles[3])
+        breakthrough = notifier.messages[1][2]
+        self.assertIn("最低平台：", breakthrough)
+        self.assertIn("Steam 预计到手：", breakthrough)
+        self.assertIn("7 日 Steam 到手 P25：", breakthrough)
+        self.assertIn("https://smis.club/commodity/1579", breakthrough)
+        self.assertIn("https://steamcommunity.com/market/listings/730/", breakthrough)
         self.assertEqual(self.storage.get_rule_state(rule["id"])["highest_notified_level"], 1)
 
     def test_breakthrough_level_includes_exact_three_percent_boundary(self):

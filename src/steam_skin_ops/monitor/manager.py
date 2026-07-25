@@ -323,7 +323,7 @@ class MonitoringManager:
             "name": item["hash_name"], "name_zh": item["cn_name"],
             **snapshot, **stats, "cached": cached, "stale": stale,
             "links": {
-                "smis": f"https://smis.club/detail/{int(item['smis_id'])}",
+                "smis": f"https://smis.club/commodity/{int(item['smis_id'])}",
                 "steam": f"https://steamcommunity.com/market/listings/{int(item['appid'])}/{quote(str(item['hash_name']))}",
             },
         }
@@ -398,7 +398,7 @@ class MonitoringManager:
                 )
                 if initial_level > 0:
                     title, content = self._format_breakthrough_alert(
-                        snapshot, rule, value, initial_depth, initial_level
+                        snapshot, stats, rule, value, initial_depth, initial_level
                     )
                 else:
                     title, content = self._format_rule_alert(snapshot, stats, rule, value)
@@ -426,7 +426,7 @@ class MonitoringManager:
                 level, depth = self._breakthrough_level(rule_type, limit, value)
                 if level > int(state["highest_notified_level"]):
                     title, content = self._format_breakthrough_alert(
-                        snapshot, rule, value, depth, level
+                        snapshot, stats, rule, value, depth, level
                     )
                     self.storage.enqueue_notification(
                         f"rule:{rule_id}:breakthrough:{level}:{observed}",
@@ -450,9 +450,10 @@ class MonitoringManager:
         depth = max(0.0, depth)
         return math.floor((depth + 1e-12) / self.breakthrough_step), depth
 
-    @staticmethod
+    @classmethod
     def _format_breakthrough_alert(
-        snapshot: MarketSnapshot, rule: dict, value: float, depth: float, level: int
+        cls, snapshot: MarketSnapshot, stats: dict, rule: dict,
+        value: float, depth: float, level: int,
     ) -> tuple[str, str]:
         rule_type = str(rule["rule_type"])
         labels = {
@@ -464,14 +465,13 @@ class MonitoringManager:
         threshold_text = (
             f"{threshold:.2f}%" if rule_type in {"ratio", "t7"} else f"¥{threshold:.2f}"
         )
-        content = "\n".join([
+        lines = [
             f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
             f"{labels[rule_type]}：{value_text}（阈值 {threshold_text}）",
             f"相对阈值继续突破：{depth:.2%}，达到第 {level} 档",
-            f"数据更新时间：{snapshot.source_updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
-            f"SMIS：https://smis.club/detail/{snapshot.smis_id}",
-        ])
-        return f"【继续突破·第 {level} 档】{snapshot.name_zh} {value_text}", content
+        ]
+        lines.extend(cls._market_reference_lines(snapshot, stats))
+        return f"【继续突破·第 {level} 档】{snapshot.name_zh} {value_text}", "\n".join(lines)
 
     def enqueue_daily_summary(self, summary_date: date) -> int:
         date_text = summary_date.isoformat()
@@ -556,23 +556,9 @@ class MonitoringManager:
             )
 
     @staticmethod
-    def _format_rule_alert(snapshot: MarketSnapshot, stats: dict, rule: dict, value: float) -> tuple[str, str]:
-        labels = {
-            "ratio": ("【即时挂刀】", "即时比例"),
-            "t7": ("【T+7挂刀】", "T+7 保守比例"),
-            "platform": ("【平台到价】", "最低平台价"),
-            "steam": ("【Steam清仓】", "Steam 售价"),
-        }
-        rule_type = str(rule["rule_type"])
-        prefix, metric_label = labels[rule_type]
+    def _market_reference_lines(snapshot: MarketSnapshot, stats: dict) -> list[str]:
+        lines: list[str] = []
         lowest = snapshot.lowest_platform
-        threshold = float(rule["threshold"])
-        value_text = f"{value:.2%}" if rule_type in {"ratio", "t7"} else f"¥{value:.2f}"
-        threshold_text = f"{threshold:.2f}%" if rule_type in {"ratio", "t7"} else f"¥{threshold:.2f}"
-        lines = [
-            f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
-            f"{metric_label}：{value_text}（阈值 {threshold_text}）",
-        ]
         if lowest:
             lines.append(f"最低平台：{lowest[0]} ¥{lowest[1]:.2f}（在售 {lowest[2]}）")
         lines.extend([
@@ -588,9 +574,29 @@ class MonitoringManager:
             ])
         lines.extend([
             f"数据更新时间：{snapshot.source_updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
-            f"SMIS：https://smis.club/detail/{snapshot.smis_id}",
+            f"SMIS：https://smis.club/commodity/{snapshot.smis_id}",
             f"Steam：https://steamcommunity.com/market/listings/{snapshot.appid}/{quote(snapshot.name)}",
         ])
+        return lines
+
+    @classmethod
+    def _format_rule_alert(cls, snapshot: MarketSnapshot, stats: dict, rule: dict, value: float) -> tuple[str, str]:
+        labels = {
+            "ratio": ("【即时挂刀】", "即时比例"),
+            "t7": ("【T+7挂刀】", "T+7 保守比例"),
+            "platform": ("【平台到价】", "最低平台价"),
+            "steam": ("【Steam清仓】", "Steam 售价"),
+        }
+        rule_type = str(rule["rule_type"])
+        prefix, metric_label = labels[rule_type]
+        threshold = float(rule["threshold"])
+        value_text = f"{value:.2%}" if rule_type in {"ratio", "t7"} else f"¥{value:.2f}"
+        threshold_text = f"{threshold:.2f}%" if rule_type in {"ratio", "t7"} else f"¥{threshold:.2f}"
+        lines = [
+            f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
+            f"{metric_label}：{value_text}（阈值 {threshold_text}）",
+        ]
+        lines.extend(cls._market_reference_lines(snapshot, stats))
         return f"{prefix}{snapshot.name_zh} {value_text}", "\n".join(lines)
 
     def dispatch_outbox(self) -> dict[str, int]:

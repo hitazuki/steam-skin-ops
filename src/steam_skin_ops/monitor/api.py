@@ -77,6 +77,7 @@ def create_app(
             SmisClient(
                 timeout=settings.smis_timeout_seconds,
                 max_retries=settings.smis_max_retries,
+                min_request_interval=settings.smis_min_request_interval_seconds,
             ),
             driver,
             max_items=settings.max_items,

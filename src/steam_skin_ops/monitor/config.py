@@ -46,6 +46,7 @@ class MonitorConfig:
     daily_summary_time: str
     smis_timeout_seconds: float
     smis_max_retries: int
+    smis_min_request_interval_seconds: float
     astrbot_base_url: str
     astrbot_api_key: str
     astrbot_message_path: str
@@ -108,6 +109,10 @@ def load_config(path: str | Path = DEFAULT_CONFIG) -> MonitorConfig:
         ),
         smis_max_retries=_positive(
             smis.get("max_retries", 3), "smis.max_retries", int
+        ),
+        smis_min_request_interval_seconds=_positive(
+            smis.get("min_request_interval_seconds", 1),
+            "smis.min_request_interval_seconds", float,
         ),
         astrbot_base_url=str(astrbot.get("base_url", "http://astrbot:6185")).rstrip("/"),
         astrbot_api_key=api_key,

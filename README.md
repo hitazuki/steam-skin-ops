@@ -79,6 +79,17 @@ GET  /healthz
 默认每 30 分钟轮询，真实请求连续失败三轮才生成异常事件。行情快照仅滚动保留
 8 天，用于 T+7 统计和最新报价缓存；历史查询接口仍直接读取 SMIS。
 
+SMIS 请求在进程内统一串行限速，默认至少间隔 1 秒。`401/403` 和普通
+`4xx` 不重试；`429` 遵循上游 `Retry-After`，连接错误及临时 `5xx` 使用
+退避重试。可在监控配置中调整：
+
+```yaml
+smis:
+  timeout_seconds: 15
+  max_retries: 3
+  min_request_interval_seconds: 1
+```
+
 监控参数统一位于 `config/monitor.yaml`，例如：
 
 ```yaml

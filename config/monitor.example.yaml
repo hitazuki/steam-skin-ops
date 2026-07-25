@@ -22,6 +22,7 @@ alerts:
 smis:
   timeout_seconds: 15
   max_retries: 3
+  min_request_interval_seconds: 1 # 所有线程共享，避免突发请求上游
 
 astrbot:
   # alerts.driver=astrbot 时使用

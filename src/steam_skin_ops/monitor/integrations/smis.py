@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -18,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 class SmisClientError(RuntimeError):
     pass
+
+
+class SmisRetryableError(SmisClientError):
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class MarketDataProvider(Protocol):
@@ -44,6 +52,7 @@ class SmisClient:
         self,
         timeout: float = 15,
         max_retries: int = 3,
+        min_request_interval: float = 1.0,
         auth_key: str = DEFAULT_AUTH_KEY,
         auth2: str = DEFAULT_AUTH2,
         session: requests.Session | None = None,
@@ -52,9 +61,16 @@ class SmisClient:
             raise ValueError("SMIS auth_key 必须是有效 AES key 长度")
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
+        if min_request_interval <= 0:
+            raise ValueError("SMIS 请求最小间隔必须大于 0")
+        self.min_request_interval = float(min_request_interval)
         self.auth_key = auth_key
         self.auth2 = auth2
         self.session = session or requests.Session()
+        self._request_lock = threading.Lock()
+        self._next_request_at = 0.0
+        self._clock = time.monotonic
+        self._sleep = time.sleep
         self.session.headers.update({
             "User-Agent": "steam-skin-ops/3.0",
             "Origin": "https://smis.club",
@@ -68,31 +84,93 @@ class SmisClient:
         encrypted = cipher.encrypt(pad(str(timestamp_ms).encode("utf-8"), AES.block_size))
         return {"Auth": base64.b64encode(encrypted).decode("ascii"), "Auth2": self.auth2}
 
+    def _send(self, method: str, path: str, headers: dict[str, str], **kwargs: Any):
+        with self._request_lock:
+            delay = self._next_request_at - self._clock()
+            if delay > 0:
+                self._sleep(delay)
+            self._next_request_at = self._clock() + self.min_request_interval
+            return self.session.request(
+                method,
+                f"{self.BASE_URL}{path}",
+                headers=headers,
+                timeout=self.timeout,
+                **kwargs,
+            )
+
+    @staticmethod
+    def _retry_after_seconds(response: requests.Response) -> float | None:
+        value = response.headers.get("Retry-After")
+        if not value:
+            return None
+        try:
+            seconds = float(value)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+        return min(max(seconds, 0.0), 60.0)
+
+    def _check_http_status(self, response: requests.Response) -> None:
+        status = response.status_code
+        if status < 400:
+            return
+        if status in {401, 403}:
+            raise SmisClientError(f"SMIS 拒绝访问（HTTP {status}）")
+        if status == 429:
+            raise SmisRetryableError(
+                "SMIS 请求过于频繁（HTTP 429）",
+                retry_after=self._retry_after_seconds(response),
+            )
+        if status in {408, 425} or 500 <= status < 600:
+            raise SmisRetryableError(f"SMIS 暂时不可用（HTTP {status}）")
+        raise SmisClientError(f"SMIS 请求不可接受（HTTP {status}）")
+
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         last_error: Exception | None = None
+        base_headers = dict(kwargs.pop("headers", {}) or {})
         for attempt in range(self.max_retries):
             try:
-                headers = dict(kwargs.pop("headers", {}) or {})
+                headers = dict(base_headers)
                 headers.update(self.build_auth_headers())
-                response = self.session.request(
-                    method,
-                    f"{self.BASE_URL}{path}",
-                    headers=headers,
-                    timeout=self.timeout,
-                    **kwargs,
-                )
-                response.raise_for_status()
+                response = self._send(method, path, headers, **kwargs)
+                self._check_http_status(response)
                 payload = response.json()
+                if not isinstance(payload, dict):
+                    raise SmisRetryableError("SMIS 返回了无效 JSON 结构")
                 if payload.get("code") != 200:
-                    raise SmisClientError(
-                        f"SMIS 返回错误 code={payload.get('code')}: {payload.get('message')}"
-                    )
+                    code = payload.get("code")
+                    message = f"SMIS 返回错误 code={code}: {payload.get('message')}"
+                    if isinstance(code, int) and code >= 500:
+                        raise SmisRetryableError(message)
+                    raise SmisClientError(message)
                 return payload.get("data")
-            except (requests.RequestException, ValueError, SmisClientError) as exc:
+            except SmisRetryableError as exc:
                 last_error = exc
-                if attempt + 1 < self.max_retries:
-                    time.sleep(min(2 ** attempt, 4))
-        raise SmisClientError(f"SMIS 请求失败: {last_error}") from last_error
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_error = exc
+            except ValueError as exc:
+                last_error = SmisRetryableError(
+                    f"SMIS 返回内容无法解析: {exc}"
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+            except SmisClientError:
+                raise
+            if attempt + 1 < self.max_retries:
+                retry_after = (
+                    last_error.retry_after
+                    if isinstance(last_error, SmisRetryableError)
+                    else None
+                )
+                self._sleep(
+                    retry_after if retry_after is not None else min(2 ** attempt, 4)
+                )
+        raise SmisClientError(f"SMIS 请求重试耗尽: {last_error}") from last_error
 
     @staticmethod
     def _smis_time(value: str) -> datetime:
