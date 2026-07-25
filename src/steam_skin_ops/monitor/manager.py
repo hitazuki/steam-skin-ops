@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from hashlib import sha1
 from pathlib import Path
 from urllib.parse import quote
 
@@ -14,6 +16,7 @@ from .history import t7_stats
 from .integrations.smis import MarketDataProvider
 from .market import MarketSnapshot
 from .repository import MonitorStorage
+from .risk import risk_prediction, snapshot_fingerprint
 from .rules import rule_value, validate_rule
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,7 @@ class MonitoringManager:
         clear_confirmations: int = 1,
         health_failure_threshold: int = 3,
         breakthrough_step_percent: float = 3,
+        poll_interval_seconds: int = 1800,
     ) -> None:
         self.storage = storage
         self.source = source
@@ -60,6 +64,7 @@ class MonitoringManager:
         self.confirmations = confirmations
         self.clear_confirmations = clear_confirmations
         self.health_failure_threshold = health_failure_threshold
+        self.poll_interval_seconds = max(1, int(poll_interval_seconds))
         if not math.isfinite(breakthrough_step_percent) or breakthrough_step_percent <= 0:
             raise ValueError("突破档位步长必须大于 0")
         self.breakthrough_step = float(breakthrough_step_percent) / 100
@@ -215,9 +220,11 @@ class MonitoringManager:
     def quote(self, query: str) -> dict:
         item_row = self._resolve_quote_item(query)
         item = item_from_row(item_row)
+        bootstrap_status: bool | None = False
         try:
-            self._ensure_history(item)
+            bootstrap_status = self._ensure_history(item)
         except Exception as exc:
+            bootstrap_status = None
             logger.warning("报价历史回填失败 smis_id=%s: %s", item["smis_id"], exc)
         latest = self.storage.latest_snapshot(item["item_key"])
         if latest and self._snapshot_age_seconds(latest) <= self.quote_cache_seconds:
@@ -230,6 +237,17 @@ class MonitoringManager:
                 return self._quote_payload(item_row, latest, cached=True, stale=False)
             try:
                 snapshot = self.source.fetch_current(item)
+                if bootstrap_status is False:
+                    try:
+                        self._backfill_changed_gap(
+                            item, latest, snapshot,
+                            self.storage.list_rules(smis_id=item["smis_id"]),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "报价缺口历史回填失败 smis_id=%s: %s",
+                            item["smis_id"], exc,
+                        )
                 self.storage.save_snapshots([snapshot])
                 row = self.storage.latest_snapshot(item["item_key"])
                 return self._quote_payload(item_row, row, cached=False, stale=False)
@@ -272,10 +290,8 @@ class MonitoringManager:
         return max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
 
     @staticmethod
-    def _snapshot_row_to_dict(row: dict | None) -> dict | None:
-        if not row:
-            return None
-        snapshot = MarketSnapshot(
+    def _snapshot_from_row(row: dict) -> MarketSnapshot:
+        return MarketSnapshot(
             item_key=row["item_key"], smis_id=row["smis_id"], appid=row["appid"],
             name=row["name"], name_zh=row["name_zh"],
             observed_at=datetime.fromisoformat(row["observed_at"]),
@@ -289,6 +305,12 @@ class MonitoringManager:
             steam_transaction_quantity=row["steam_transaction_quantity"],
             buff_to_steam_ratio=row["buff_to_steam_ratio"], kind=row["kind"], source=row["source"],
         )
+
+    @classmethod
+    def _snapshot_row_to_dict(cls, row: dict | None) -> dict | None:
+        if not row:
+            return None
+        snapshot = cls._snapshot_from_row(row)
         lowest = snapshot.lowest_platform
         return {
             "observed_at": snapshot.observed_at.isoformat(),
@@ -316,50 +338,140 @@ class MonitoringManager:
         }
 
     def _quote_payload(self, item: dict, row: dict, *, cached: bool, stale: bool) -> dict:
+        snapshot_object = self._snapshot_from_row(row)
         snapshot = self._snapshot_row_to_dict(row)
         stats = self._t7_stats(str(item["item_key"]))
+        risk = self._risk_prediction(
+            str(item["item_key"]), snapshot_object, stats, stale=stale
+        )
         return {
             "smis_id": int(item["smis_id"]), "appid": int(item["appid"]),
             "name": item["hash_name"], "name_zh": item["cn_name"],
-            **snapshot, **stats, "cached": cached, "stale": stale,
+            **snapshot, **stats, "risk_prediction": risk,
+            "cached": cached, "stale": stale,
             "links": {
                 "smis": f"https://smis.club/commodity/{int(item['smis_id'])}",
                 "steam": f"https://steamcommunity.com/market/listings/{int(item['appid'])}/{quote(str(item['hash_name']))}",
             },
         }
 
-    def _ensure_history(self, item: dict) -> None:
-        rows = self.storage.steam_history(item["item_key"], days=7)
-        if not self._history_needs_backfill(rows):
-            return
-        snapshots = self.source.fetch_history(item, 7)
+    def _ensure_history(self, item: dict) -> bool | None:
+        earliest_text = self.storage.earliest_market_time(item["item_key"])
+        if earliest_text:
+            earliest = datetime.fromisoformat(earliest_text)
+            if datetime.now(timezone.utc) - earliest >= timedelta(days=29):
+                return False
+        key = f"history-bootstrap:{item['item_key']}:30"
+        attempted = self.storage.get_metadata(key)
+        if attempted == "done":
+            return False
+        if attempted:
+            try:
+                if datetime.now(timezone.utc) - datetime.fromisoformat(attempted) < timedelta(hours=6):
+                    return None
+            except ValueError:
+                pass
+        self.storage.set_metadata(key, datetime.now(timezone.utc).isoformat())
+        snapshots = self.source.fetch_history(item, 30)
         self.storage.save_snapshots(snapshots)
+        self.storage.set_metadata(key, "done")
+        return True
 
-    @staticmethod
-    def _history_needs_backfill(rows: list[dict]) -> bool:
-        if len(rows) < 12:
-            return True
-        first = datetime.fromisoformat(str(rows[0]["source_updated_at"]))
-        last = datetime.fromisoformat(str(rows[-1]["source_updated_at"]))
-        span_days = (last - first).total_seconds() / 86400
-        age_hours = (datetime.now(timezone.utc) - last).total_seconds() / 3600
-        return span_days < 5.5 or age_hours > 6
+    def _attempt_pending_gap_backfill(self, item: dict) -> bool:
+        pending_key = f"history-gap-pending:{item['item_key']}"
+        raw = self.storage.get_metadata(pending_key)
+        if not raw:
+            return False
+        try:
+            pending = json.loads(raw)
+            attempted = pending.get("attempted_at")
+            if attempted and (
+                datetime.now(timezone.utc) - datetime.fromisoformat(attempted)
+                < timedelta(hours=6)
+            ):
+                return True
+            pending["attempted_at"] = datetime.now(timezone.utc).isoformat()
+            self.storage.set_metadata(pending_key, json.dumps(pending))
+            snapshots = self.source.fetch_history(item, int(pending["days"]))
+            self.storage.save_snapshots(snapshots)
+            self.storage.set_metadata(str(pending["done_key"]), "done")
+            self.storage.set_metadata(pending_key, "")
+            return False
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("忽略无效的缺口回填状态 item_key=%s", item["item_key"])
+            self.storage.set_metadata(pending_key, "")
+            return False
+
+    def _backfill_changed_gap(
+        self, item: dict, previous: dict | None, snapshot: MarketSnapshot, rules: list[dict],
+    ) -> None:
+        if self._attempt_pending_gap_backfill(item):
+            return
+        if previous is None:
+            return
+        previous_observed = datetime.fromisoformat(str(previous["observed_at"]))
+        gap_seconds = max(0.0, (snapshot.observed_at - previous_observed).total_seconds())
+        had_failure = any(
+            int(self.storage.get_health_state(item["smis_id"], str(rule["recipient_key"]))[
+                "fetch_failures"
+            ]) > 0
+            for rule in rules
+        )
+        missed_observation = gap_seconds > self.poll_interval_seconds * 2
+        if not had_failure and not missed_observation:
+            return
+        if snapshot_fingerprint(previous) == snapshot_fingerprint(snapshot):
+            return
+        days = max(1, min(30, math.ceil(gap_seconds / 86400)))
+        signature = (
+            f"{item['item_key']}|{previous['observed_at']}|"
+            f"{snapshot.observed_at.isoformat()}|{days}"
+        )
+        digest = sha1(signature.encode("utf-8")).hexdigest()[:16]
+        key = f"history-gap:{item['item_key']}:{digest}"
+        state = self.storage.get_metadata(key)
+        if state == "done":
+            return
+        pending_key = f"history-gap-pending:{item['item_key']}"
+        pending = {
+            "done_key": key,
+            "days": days,
+            "gap_started_at": previous["observed_at"],
+            "gap_ended_at": snapshot.observed_at.isoformat(),
+            "attempted_at": None,
+        }
+        self.storage.set_metadata(pending_key, json.dumps(pending))
+        self._attempt_pending_gap_backfill(item)
 
     def _t7_stats(self, item_key: str) -> dict:
         return t7_stats(self.storage.steam_history(item_key, days=7))
+
+    def _risk_prediction(
+        self, item_key: str, snapshot: MarketSnapshot, stats: dict, *, stale: bool = False,
+    ) -> dict:
+        rows = self.storage.market_history_rows(item_key, days=30)
+        return risk_prediction(rows, snapshot, stats, stale=stale)
 
     def monitor_item(self, item_row: dict) -> dict:
         item = item_from_row(item_row)
         rules = self.storage.list_rules(smis_id=item["smis_id"])
         if not rules:
             return {"smis_id": item["smis_id"], "skipped": True}
+        previous = self.storage.latest_snapshot(item["item_key"])
+        bootstrap_status: bool | None = False
         try:
             try:
-                self._ensure_history(item)
+                bootstrap_status = self._ensure_history(item)
             except Exception as exc:
+                bootstrap_status = None
                 logger.warning("T+7 历史回填失败 smis_id=%s: %s", item["smis_id"], exc)
             with self._lock_for(item["smis_id"]):
                 snapshot = self.source.fetch_current(item)
+                if bootstrap_status is False:
+                    try:
+                        self._backfill_changed_gap(item, previous, snapshot, rules)
+                    except Exception as exc:
+                        logger.warning("缺口历史回填失败 smis_id=%s: %s", item["smis_id"], exc)
                 self.storage.save_snapshots([snapshot])
         except Exception as exc:
             self._handle_item_failure(item, rules, exc)
@@ -367,11 +479,14 @@ class MonitoringManager:
 
         self._handle_item_recovery(item, rules, snapshot)
         stats = self._t7_stats(item["item_key"])
+        risk = self._risk_prediction(item["item_key"], snapshot, stats)
         for rule in rules:
-            self._evaluate_rule(snapshot, stats, rule)
+            self._evaluate_rule(snapshot, stats, risk, rule)
         return {"smis_id": item["smis_id"], "success": True}
 
-    def _evaluate_rule(self, snapshot: MarketSnapshot, stats: dict, rule: dict) -> None:
+    def _evaluate_rule(
+        self, snapshot: MarketSnapshot, stats: dict, risk: dict, rule: dict,
+    ) -> None:
         rule_id = int(rule["id"])
         rule_type = str(rule["rule_type"])
         threshold = float(rule["threshold"])
@@ -398,10 +513,10 @@ class MonitoringManager:
                 )
                 if initial_level > 0:
                     title, content = self._format_breakthrough_alert(
-                        snapshot, stats, rule, value, initial_depth, initial_level
+                        snapshot, stats, risk, rule, value, initial_depth, initial_level
                     )
                 else:
-                    title, content = self._format_rule_alert(snapshot, stats, rule, value)
+                    title, content = self._format_rule_alert(snapshot, stats, risk, rule, value)
                 signal = f"rule:{rule_id}:{observed}"
                 self.storage.enqueue_notification(
                     signal, str(rule["recipient_key"]), f"rule_{rule_type}", title, content,
@@ -426,7 +541,7 @@ class MonitoringManager:
                 level, depth = self._breakthrough_level(rule_type, limit, value)
                 if level > int(state["highest_notified_level"]):
                     title, content = self._format_breakthrough_alert(
-                        snapshot, stats, rule, value, depth, level
+                        snapshot, stats, risk, rule, value, depth, level
                     )
                     self.storage.enqueue_notification(
                         f"rule:{rule_id}:breakthrough:{level}:{observed}",
@@ -452,7 +567,7 @@ class MonitoringManager:
 
     @classmethod
     def _format_breakthrough_alert(
-        cls, snapshot: MarketSnapshot, stats: dict, rule: dict,
+        cls, snapshot: MarketSnapshot, stats: dict, risk: dict, rule: dict,
         value: float, depth: float, level: int,
     ) -> tuple[str, str]:
         rule_type = str(rule["rule_type"])
@@ -470,7 +585,7 @@ class MonitoringManager:
             f"{labels[rule_type]}：{value_text}（阈值 {threshold_text}）",
             f"相对阈值继续突破：{depth:.2%}，达到第 {level} 档",
         ]
-        lines.extend(cls._market_reference_lines(snapshot, stats))
+        lines.extend(cls._market_reference_lines(snapshot, stats, risk))
         return f"【继续突破·第 {level} 档】{snapshot.name_zh} {value_text}", "\n".join(lines)
 
     def enqueue_daily_summary(self, summary_date: date) -> int:
@@ -499,6 +614,7 @@ class MonitoringManager:
             "ratio": "即时比例", "t7": "T+7 比例",
             "platform": "平台价", "steam": "Steam 价",
         }
+        risk_cache: dict[str, dict] = {}
         for recipient_key, entries in sorted(grouped.items()):
             lines = [f"当前仍满足条件的交易告警共 {len(entries)} 条："]
             for rule, state, level, depth in entries:
@@ -509,9 +625,33 @@ class MonitoringManager:
                     values = f"{value:.2%} / 阈值 {threshold:.2f}%"
                 else:
                     values = f"¥{value:.2f} / 阈值 ¥{threshold:.2f}"
+                item_key = str(rule["item_key"])
+                if item_key not in risk_cache:
+                    latest = self.storage.latest_snapshot(item_key)
+                    if latest:
+                        snapshot = self._snapshot_from_row(latest)
+                        stats = self._t7_stats(item_key)
+                        stale = (
+                            self._snapshot_age_seconds(latest)
+                            > self.poll_interval_seconds * 2
+                        )
+                        risk_cache[item_key] = self._risk_prediction(
+                            item_key, snapshot, stats, stale=stale
+                        )
+                    else:
+                        risk_cache[item_key] = {"status": "unavailable"}
+                risk = risk_cache[item_key]
+                risk_suffix = ""
+                if risk.get("status") == "ready":
+                    risk_suffix = (
+                        f" · 风险{self._risk_level_text(risk)}"
+                        f"/{float(risk['risk_ratio']):.2%}"
+                    )
+                else:
+                    risk_suffix = " · 风险预测不可用"
                 lines.append(
                     f"#{int(rule['id'])} {rule['cn_name']} · {labels[rule_type]} "
-                    f"{values} · 第 {level} 档（{depth:.2%}）"
+                    f"{values} · 第 {level} 档（{depth:.2%}）{risk_suffix}"
                 )
             queued += int(self.storage.enqueue_notification(
                 f"daily-summary:{date_text}", recipient_key, "daily_summary",
@@ -556,7 +696,32 @@ class MonitoringManager:
             )
 
     @staticmethod
-    def _market_reference_lines(snapshot: MarketSnapshot, stats: dict) -> list[str]:
+    def _risk_level_text(risk: dict) -> str:
+        return {"low": "低", "medium": "中", "high": "高"}.get(
+            str(risk.get("level")), "未知"
+        )
+
+    @classmethod
+    def _risk_reference_lines(cls, risk: dict) -> list[str]:
+        if risk.get("status") != "ready":
+            reasons = risk.get("reasons") or ["历史或当前行情不足"]
+            return [f"风险预测：不可用（{reasons[0]}）"]
+        change = float(risk["forecast_change_pct"]) / 100
+        lines = [
+            f"风险预测：{cls._risk_level_text(risk)}"
+            f"｜风险比例 {float(risk['risk_ratio']):.2%}"
+            f"｜预测到手 ¥{float(risk['forecast_steam_net_t7']):.2f}"
+            f"（{change:+.1%}）"
+        ]
+        reasons = risk.get("reasons") or []
+        if reasons:
+            lines.append(f"风险说明：{'；'.join(str(reason) for reason in reasons[:3])}")
+        return lines
+
+    @classmethod
+    def _market_reference_lines(
+        cls, snapshot: MarketSnapshot, stats: dict, risk: dict,
+    ) -> list[str]:
         lines: list[str] = []
         lowest = snapshot.lowest_platform
         if lowest:
@@ -572,6 +737,7 @@ class MonitoringManager:
                 f"7 日 Steam 到手 P25：¥{stats['t7_steam_net_p25']:.2f}",
                 f"7 日 Steam 到手中位数：¥{stats['t7_steam_net_median']:.2f}",
             ])
+        lines.extend(cls._risk_reference_lines(risk))
         lines.extend([
             f"数据更新时间：{snapshot.source_updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
             f"SMIS：https://smis.club/commodity/{snapshot.smis_id}",
@@ -580,7 +746,10 @@ class MonitoringManager:
         return lines
 
     @classmethod
-    def _format_rule_alert(cls, snapshot: MarketSnapshot, stats: dict, rule: dict, value: float) -> tuple[str, str]:
+    def _format_rule_alert(
+        cls, snapshot: MarketSnapshot, stats: dict, risk: dict,
+        rule: dict, value: float,
+    ) -> tuple[str, str]:
         labels = {
             "ratio": ("【即时挂刀】", "即时比例"),
             "t7": ("【T+7挂刀】", "T+7 保守比例"),
@@ -596,7 +765,7 @@ class MonitoringManager:
             f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
             f"{metric_label}：{value_text}（阈值 {threshold_text}）",
         ]
-        lines.extend(cls._market_reference_lines(snapshot, stats))
+        lines.extend(cls._market_reference_lines(snapshot, stats, risk))
         return f"{prefix}{snapshot.name_zh} {value_text}", "\n".join(lines)
 
     def dispatch_outbox(self) -> dict[str, int]:

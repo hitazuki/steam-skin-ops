@@ -728,13 +728,38 @@ class MonitorStorage:
             for key, value in sorted(deduped.items())
         ]
 
-    def prune_snapshots(self, retain_days: int = 8) -> int:
+    def market_history_rows(
+        self, item_key: str, days: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Return raw successful observations for canonical analysis."""
+        from datetime import timedelta
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat()
+        with self.connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM market_snapshots
+                WHERE item_key=? AND observed_at>=?
+                ORDER BY observed_at,id
+            """, (item_key, cutoff)).fetchall()
+        return [dict(row) for row in rows]
+
+    def earliest_market_time(self, item_key: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("""
+                SELECT MIN(
+                    CASE WHEN kind='current' THEN observed_at ELSE source_updated_at END
+                ) FROM market_snapshots
+                WHERE item_key=? AND steam_sell_price>0
+            """, (item_key,)).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def prune_snapshots(self, retain_days: int = 30) -> int:
         from datetime import timedelta
 
         cutoff = (datetime.now(timezone.utc) - timedelta(days=int(retain_days))).isoformat()
         with self.connect() as conn:
             cursor = conn.execute(
-                "DELETE FROM market_snapshots WHERE source_updated_at<?", (cutoff,)
+                "DELETE FROM market_snapshots WHERE observed_at<?", (cutoff,)
             )
             return int(cursor.rowcount)
 

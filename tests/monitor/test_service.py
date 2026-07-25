@@ -1,5 +1,6 @@
 import unittest
 import sqlite3
+import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -46,6 +47,7 @@ class FakeSource:
         self.ratios = list(ratios or [0.70])
         self.current_calls = 0
         self.history_calls = 0
+        self.history_days = []
 
     def fetch_metadata(self, smis_id):
         if int(smis_id) != 1579:
@@ -66,6 +68,7 @@ class FakeSource:
 
     def fetch_history(self, item, days):
         self.history_calls += 1
+        self.history_days.append(days)
         result = []
         for index in range(13):
             history = snapshot(0.74, -(index * 12 * 3600))
@@ -403,6 +406,7 @@ alerts:
         self.assertIn("最低平台：", breakthrough)
         self.assertIn("Steam 预计到手：", breakthrough)
         self.assertIn("7 日 Steam 到手 P25：", breakthrough)
+        self.assertIn("风险预测：", breakthrough)
         self.assertIn("https://smis.club/commodity/1579", breakthrough)
         self.assertIn("https://steamcommunity.com/market/listings/730/", breakthrough)
         self.assertEqual(self.storage.get_rule_state(rule["id"])["highest_notified_level"], 1)
@@ -426,6 +430,7 @@ alerts:
         manager.dispatch_outbox()
         self.assertEqual(len(notifier.messages), 1)
         self.assertIn("共 2 条", notifier.messages[0][2])
+        self.assertIn("风险预测", notifier.messages[0][2])
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
         manager.dispatch_outbox()
         self.assertEqual(len(notifier.messages), 1)
@@ -570,6 +575,7 @@ alerts:
                 "/v2/market/quote", headers=headers, params={"q": "1579"}
             )
             self.assertTrue(quote_response.json()["ok"])
+            self.assertIn("risk_prediction", quote_response.json()["data"])
             bad = client.patch(f"/v2/rules/{rule_id}", headers=headers, json={
                 "recipient_key": "astrQQ:FriendMessage:test", "threshold": 0,
             })
@@ -636,8 +642,97 @@ alerts:
         item = dict(ITEM)
         manager._ensure_history(item)
         self.assertEqual(manager.source.history_calls, 1)
+        self.assertEqual(manager.source.history_days, [30])
         manager._ensure_history(item)
         self.assertEqual(manager.source.history_calls, 1)
+
+    def test_unchanged_market_after_observation_gap_does_not_backfill(self):
+        manager = self.manager()
+        old = snapshot(0.70, -(4 * 3600))
+        current = MarketSnapshot(**{
+            **old.__dict__,
+            "observed_at": datetime.now(timezone.utc),
+        })
+        previous = {
+            **old.__dict__,
+            "observed_at": old.observed_at.isoformat(),
+            "source_updated_at": old.source_updated_at.isoformat(),
+        }
+
+        manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+
+        self.assertEqual(manager.source.history_calls, 0)
+
+    def test_changed_gap_uses_minimum_integer_day_window(self):
+        manager = self.manager()
+        now = datetime.now(timezone.utc)
+        for hours, expected_days in ((23, 1), (25, 2)):
+            old = snapshot(0.70, -(hours * 3600))
+            current = snapshot(0.75)
+            previous = {
+                **old.__dict__,
+                "observed_at": (now - timedelta(hours=hours)).isoformat(),
+                "source_updated_at": old.source_updated_at.isoformat(),
+            }
+            current = MarketSnapshot(**{
+                **current.__dict__,
+                "observed_at": now,
+            })
+            manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+            self.assertEqual(manager.source.history_days[-1], expected_days)
+
+        self.assertEqual(manager.source.history_days, [1, 2])
+
+    def test_failed_gap_backfill_is_retained_for_six_hour_retry(self):
+        class FailOnceHistorySource(FakeSource):
+            def fetch_history(self, item, days):
+                self.history_calls += 1
+                self.history_days.append(days)
+                if self.history_calls == 1:
+                    raise RuntimeError("temporary history failure")
+                return []
+
+        source = FailOnceHistorySource()
+        manager = MonitoringManager(self.storage, source, FakeNotifier())
+        now = datetime.now(timezone.utc)
+        old = snapshot(0.70, -(25 * 3600))
+        previous = {
+            **old.__dict__,
+            "observed_at": (now - timedelta(hours=25)).isoformat(),
+            "source_updated_at": old.source_updated_at.isoformat(),
+        }
+        current = MarketSnapshot(**{
+            **snapshot(0.75).__dict__,
+            "observed_at": now,
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "temporary"):
+            manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+        manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+        self.assertEqual(source.history_calls, 1)
+
+        pending_key = f"history-gap-pending:{ITEM['item_key']}"
+        pending = json.loads(self.storage.get_metadata(pending_key))
+        pending["attempted_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=6, minutes=1)
+        ).isoformat()
+        self.storage.set_metadata(pending_key, json.dumps(pending))
+        manager._backfill_changed_gap(dict(ITEM), previous, current, [])
+
+        self.assertEqual(source.history_days, [2, 2])
+        self.assertEqual(self.storage.get_metadata(pending_key), "")
+
+    def test_pruning_uses_successful_observation_time_for_cold_items(self):
+        old_source = datetime.now(timezone.utc) - timedelta(days=40)
+        current = snapshot(0.70)
+        current = MarketSnapshot(**{
+            **current.__dict__,
+            "source_updated_at": old_source,
+        })
+        self.storage.save_snapshots([current])
+
+        self.assertEqual(self.storage.prune_snapshots(retain_days=30), 0)
+        self.assertIsNotNone(self.storage.latest_snapshot(ITEM["item_key"]))
 
     def test_adding_same_rule_updates_existing_rule_and_resets_state(self):
         manager = self.manager()

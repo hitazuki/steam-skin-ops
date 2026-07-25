@@ -83,6 +83,7 @@ def create_app(
             max_items=settings.max_items,
             quote_cache_seconds=settings.quote_cache_seconds,
             breakthrough_step_percent=settings.breakthrough_step_percent,
+            poll_interval_seconds=settings.interval_seconds,
         )
     if runtime is None:
         runtime = ServiceRuntime(

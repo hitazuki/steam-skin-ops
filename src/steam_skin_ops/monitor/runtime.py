@@ -72,7 +72,7 @@ class ServiceRuntime:
             self.manager.enqueue_daily_summary(today)
             self.manager.dispatch_outbox()
         if self.last_backup_date != today:
-            self.manager.storage.prune_snapshots(retain_days=8)
+            self.manager.storage.prune_snapshots(retain_days=30)
             self.manager.backup(self.backup_dir)
             self.last_backup_date = today
         return results

@@ -116,6 +116,21 @@ class SteamSkinOpsPlugin(Star):
                 f"T+7 历史：{data.get('t7_sample_count', 0)} 点 / {data.get('t7_span_days', 0)} 天"
                 f"（{'充足' if data.get('t7_sufficient') else '不足'}）",
             ])
+        risk = data.get("risk_prediction") or {}
+        if risk.get("status") == "ready":
+            level = {"low": "低", "medium": "中", "high": "高"}.get(
+                risk.get("level"), "未知"
+            )
+            lines.append(
+                f"T+7 风险预测：{level}风险｜风险比例 "
+                f"{float(risk['risk_ratio']):.2%}｜预测到手 "
+                f"¥{float(risk['forecast_steam_net_t7']):.2f}"
+            )
+            for reason in (risk.get("reasons") or [])[:3]:
+                lines.append(f"- {reason}")
+        else:
+            reason = (risk.get("reasons") or ["历史或当前行情不足"])[0]
+            lines.append(f"T+7 风险预测：不可用（{reason}）")
         lines.extend([
             f"数据更新时间：{source_time}", f"SMIS：{data['links']['smis']}",
             f"Steam：{data['links']['steam']}",
