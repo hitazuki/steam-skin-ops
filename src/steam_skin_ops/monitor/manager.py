@@ -16,7 +16,7 @@ from .history import t7_stats
 from .integrations.smis import MarketDataProvider
 from .market import MarketSnapshot
 from .repository import MonitorStorage
-from .risk import risk_prediction, snapshot_fingerprint
+from .risk import forecast_and_risk, snapshot_fingerprint
 from .rules import rule_value, validate_rule
 
 logger = logging.getLogger(__name__)
@@ -341,13 +341,13 @@ class MonitoringManager:
         snapshot_object = self._snapshot_from_row(row)
         snapshot = self._snapshot_row_to_dict(row)
         stats = self._t7_stats(str(item["item_key"]))
-        risk = self._risk_prediction(
+        forecast, risk = self._forecast_and_risk(
             str(item["item_key"]), snapshot_object, stats, stale=stale
         )
         return {
             "smis_id": int(item["smis_id"]), "appid": int(item["appid"]),
             "name": item["hash_name"], "name_zh": item["cn_name"],
-            **snapshot, **stats, "risk_prediction": risk,
+            **snapshot, **stats, "forecast": forecast, "risk_assessment": risk,
             "cached": cached, "stale": stale,
             "links": {
                 "smis": f"https://smis.club/commodity/{int(item['smis_id'])}",
@@ -446,11 +446,11 @@ class MonitoringManager:
     def _t7_stats(self, item_key: str) -> dict:
         return t7_stats(self.storage.steam_history(item_key, days=7))
 
-    def _risk_prediction(
+    def _forecast_and_risk(
         self, item_key: str, snapshot: MarketSnapshot, stats: dict, *, stale: bool = False,
-    ) -> dict:
+    ) -> tuple[dict, dict]:
         rows = self.storage.market_history_rows(item_key, days=30)
-        return risk_prediction(rows, snapshot, stats, stale=stale)
+        return forecast_and_risk(rows, snapshot, stats, stale=stale)
 
     def monitor_item(self, item_row: dict) -> dict:
         item = item_from_row(item_row)
@@ -479,13 +479,14 @@ class MonitoringManager:
 
         self._handle_item_recovery(item, rules, snapshot)
         stats = self._t7_stats(item["item_key"])
-        risk = self._risk_prediction(item["item_key"], snapshot, stats)
+        forecast, risk = self._forecast_and_risk(item["item_key"], snapshot, stats)
         for rule in rules:
-            self._evaluate_rule(snapshot, stats, risk, rule)
+            self._evaluate_rule(snapshot, stats, forecast, risk, rule)
         return {"smis_id": item["smis_id"], "success": True}
 
     def _evaluate_rule(
-        self, snapshot: MarketSnapshot, stats: dict, risk: dict, rule: dict,
+        self, snapshot: MarketSnapshot, stats: dict, forecast: dict,
+        risk: dict, rule: dict,
     ) -> None:
         rule_id = int(rule["id"])
         rule_type = str(rule["rule_type"])
@@ -513,10 +514,13 @@ class MonitoringManager:
                 )
                 if initial_level > 0:
                     title, content = self._format_breakthrough_alert(
-                        snapshot, stats, risk, rule, value, initial_depth, initial_level
+                        snapshot, stats, forecast, risk, rule,
+                        value, initial_depth, initial_level
                     )
                 else:
-                    title, content = self._format_rule_alert(snapshot, stats, risk, rule, value)
+                    title, content = self._format_rule_alert(
+                        snapshot, stats, forecast, risk, rule, value
+                    )
                 signal = f"rule:{rule_id}:{observed}"
                 self.storage.enqueue_notification(
                     signal, str(rule["recipient_key"]), f"rule_{rule_type}", title, content,
@@ -541,7 +545,7 @@ class MonitoringManager:
                 level, depth = self._breakthrough_level(rule_type, limit, value)
                 if level > int(state["highest_notified_level"]):
                     title, content = self._format_breakthrough_alert(
-                        snapshot, stats, risk, rule, value, depth, level
+                        snapshot, stats, forecast, risk, rule, value, depth, level
                     )
                     self.storage.enqueue_notification(
                         f"rule:{rule_id}:breakthrough:{level}:{observed}",
@@ -567,7 +571,8 @@ class MonitoringManager:
 
     @classmethod
     def _format_breakthrough_alert(
-        cls, snapshot: MarketSnapshot, stats: dict, risk: dict, rule: dict,
+        cls, snapshot: MarketSnapshot, stats: dict, forecast: dict,
+        risk: dict, rule: dict,
         value: float, depth: float, level: int,
     ) -> tuple[str, str]:
         rule_type = str(rule["rule_type"])
@@ -585,7 +590,7 @@ class MonitoringManager:
             f"{labels[rule_type]}：{value_text}（阈值 {threshold_text}）",
             f"相对阈值继续突破：{depth:.2%}，达到第 {level} 档",
         ]
-        lines.extend(cls._market_reference_lines(snapshot, stats, risk))
+        lines.extend(cls._market_reference_lines(snapshot, stats, forecast, risk))
         return f"【继续突破·第 {level} 档】{snapshot.name_zh} {value_text}", "\n".join(lines)
 
     def enqueue_daily_summary(self, summary_date: date) -> int:
@@ -614,7 +619,7 @@ class MonitoringManager:
             "ratio": "即时比例", "t7": "T+7 比例",
             "platform": "平台价", "steam": "Steam 价",
         }
-        risk_cache: dict[str, dict] = {}
+        analysis_cache: dict[str, tuple[dict, dict]] = {}
         for recipient_key, entries in sorted(grouped.items()):
             lines = [f"当前仍满足条件的交易告警共 {len(entries)} 条："]
             for rule, state, level, depth in entries:
@@ -626,7 +631,7 @@ class MonitoringManager:
                 else:
                     values = f"¥{value:.2f} / 阈值 ¥{threshold:.2f}"
                 item_key = str(rule["item_key"])
-                if item_key not in risk_cache:
+                if item_key not in analysis_cache:
                     latest = self.storage.latest_snapshot(item_key)
                     if latest:
                         snapshot = self._snapshot_from_row(latest)
@@ -635,23 +640,17 @@ class MonitoringManager:
                             self._snapshot_age_seconds(latest)
                             > self.poll_interval_seconds * 2
                         )
-                        risk_cache[item_key] = self._risk_prediction(
+                        analysis_cache[item_key] = self._forecast_and_risk(
                             item_key, snapshot, stats, stale=stale
                         )
                     else:
-                        risk_cache[item_key] = {"status": "unavailable"}
-                risk = risk_cache[item_key]
-                risk_suffix = ""
-                if risk.get("status") == "ready":
-                    risk_suffix = (
-                        f" · 风险{self._risk_level_text(risk)}"
-                        f"/{float(risk['risk_ratio']):.2%}"
-                    )
-                else:
-                    risk_suffix = " · 风险预测不可用"
+                        unavailable = {"status": "unavailable"}
+                        analysis_cache[item_key] = (unavailable, unavailable)
+                forecast, risk = analysis_cache[item_key]
+                analysis_suffix = self._daily_analysis_suffix(forecast, risk)
                 lines.append(
                     f"#{int(rule['id'])} {rule['cn_name']} · {labels[rule_type]} "
-                    f"{values} · 第 {level} 档（{depth:.2%}）{risk_suffix}"
+                    f"{values} · 第 {level} 档（{depth:.2%}）{analysis_suffix}"
                 )
             queued += int(self.storage.enqueue_notification(
                 f"daily-summary:{date_text}", recipient_key, "daily_summary",
@@ -696,31 +695,77 @@ class MonitoringManager:
             )
 
     @staticmethod
-    def _risk_level_text(risk: dict) -> str:
+    def _level_text(level: object) -> str:
         return {"low": "低", "medium": "中", "high": "高"}.get(
-            str(risk.get("level")), "未知"
+            str(level), "未知"
         )
 
     @classmethod
-    def _risk_reference_lines(cls, risk: dict) -> list[str]:
-        if risk.get("status") != "ready":
-            reasons = risk.get("reasons") or ["历史或当前行情不足"]
-            return [f"风险预测：不可用（{reasons[0]}）"]
-        change = float(risk["forecast_change_pct"]) / 100
-        lines = [
-            f"风险预测：{cls._risk_level_text(risk)}"
-            f"｜风险比例 {float(risk['risk_ratio']):.2%}"
-            f"｜预测到手 ¥{float(risk['forecast_steam_net_t7']):.2f}"
-            f"（{change:+.1%}）"
-        ]
-        reasons = risk.get("reasons") or []
-        if reasons:
-            lines.append(f"风险说明：{'；'.join(str(reason) for reason in reasons[:3])}")
+    def _analysis_reference_lines(cls, forecast: dict, risk: dict) -> list[str]:
+        lines: list[str] = []
+        if forecast.get("status") == "ready":
+            ratio = forecast.get("forecast_balance_ratio")
+            ratio_text = f"{float(ratio):.2%}" if ratio is not None else "不可用"
+            window = int(forecast.get("window_days") or 0)
+            window_text = f"{window} 日" if window else ""
+            lines.extend([
+                f"七日预测：¥{float(forecast['predicted_steam_net']):.2f}"
+                f"（{float(forecast['change_pct']) / 100:+.1%}）"
+                f"｜预测倒余额比例 {ratio_text}",
+                f"预测模式：{window_text}{forecast['mode_label']}（"
+                f"{'正常' if forecast.get('confidence') == 'normal' else '低'}置信度）",
+            ])
+        else:
+            reasons = forecast.get("reasons") or ["历史或当前行情不足"]
+            lines.append(f"七日预测：不可用（{reasons[0]}）")
+
+        if risk.get("status") == "ready":
+            dimensions = risk.get("dimensions") or {}
+            labels = {"price": "价格", "volatility": "波动", "inventory": "库存", "volume": "成交量"}
+            dimension_text = "、".join(
+                f"{labels[key]}{cls._level_text((dimensions.get(key) or {}).get('level'))}"
+                for key in labels
+            )
+            ratio = risk.get("risk_balance_ratio")
+            ratio_text = f"{float(ratio):.2%}" if ratio is not None else "不可用"
+            lines.append(
+                f"风险评估：总体{cls._level_text(risk.get('overall_level'))}"
+                f"｜{dimension_text}｜风险倒余额比例 {ratio_text}"
+            )
+            reasons = risk.get("reasons") or []
+            if reasons:
+                lines.append(f"风险说明：{'；'.join(str(reason) for reason in reasons[:3])}")
+        else:
+            lines.append("风险评估：不可用")
         return lines
 
     @classmethod
+    def _daily_analysis_suffix(cls, forecast: dict, risk: dict) -> str:
+        if forecast.get("status") == "ready":
+            forecast_ratio = forecast.get("forecast_balance_ratio")
+            forecast_text = (
+                f"预测{float(forecast['change_pct']) / 100:+.1%}"
+                f"/{float(forecast_ratio):.2%}"
+                if forecast_ratio is not None else
+                f"预测{float(forecast['change_pct']) / 100:+.1%}"
+            )
+            mode_text = str(forecast.get("mode_label") or "未知模式")
+        else:
+            forecast_text, mode_text = "预测不可用", ""
+        if risk.get("status") == "ready":
+            risk_ratio = risk.get("risk_balance_ratio")
+            risk_text = f"风险{cls._level_text(risk.get('overall_level'))}"
+            if risk_ratio is not None:
+                risk_text += f"/{float(risk_ratio):.2%}"
+        else:
+            risk_text = "风险不可用"
+        mode_suffix = f"({mode_text})" if mode_text else ""
+        return f" · {forecast_text}{mode_suffix} · {risk_text}"
+
+    @classmethod
     def _market_reference_lines(
-        cls, snapshot: MarketSnapshot, stats: dict, risk: dict,
+        cls, snapshot: MarketSnapshot, stats: dict,
+        forecast: dict, risk: dict,
     ) -> list[str]:
         lines: list[str] = []
         lowest = snapshot.lowest_platform
@@ -737,7 +782,7 @@ class MonitoringManager:
                 f"7 日 Steam 到手 P25：¥{stats['t7_steam_net_p25']:.2f}",
                 f"7 日 Steam 到手中位数：¥{stats['t7_steam_net_median']:.2f}",
             ])
-        lines.extend(cls._risk_reference_lines(risk))
+        lines.extend(cls._analysis_reference_lines(forecast, risk))
         lines.extend([
             f"数据更新时间：{snapshot.source_updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
             f"SMIS：https://smis.club/commodity/{snapshot.smis_id}",
@@ -747,7 +792,7 @@ class MonitoringManager:
 
     @classmethod
     def _format_rule_alert(
-        cls, snapshot: MarketSnapshot, stats: dict, risk: dict,
+        cls, snapshot: MarketSnapshot, stats: dict, forecast: dict, risk: dict,
         rule: dict, value: float,
     ) -> tuple[str, str]:
         labels = {
@@ -765,7 +810,7 @@ class MonitoringManager:
             f"规则 #{int(rule['id'])} · {snapshot.name_zh} / {snapshot.name}",
             f"{metric_label}：{value_text}（阈值 {threshold_text}）",
         ]
-        lines.extend(cls._market_reference_lines(snapshot, stats, risk))
+        lines.extend(cls._market_reference_lines(snapshot, stats, forecast, risk))
         return f"{prefix}{snapshot.name_zh} {value_text}", "\n".join(lines)
 
     def dispatch_outbox(self) -> dict[str, int]:

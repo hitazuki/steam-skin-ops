@@ -30,6 +30,9 @@ class AstrBotPluginContractTest(unittest.TestCase):
         self.assertIn("event.unified_msg_origin", source)
         self.assertIn("filter.PermissionType.ADMIN", source)
         self.assertIn('"/v2/rules"', source)
+        self.assertIn('data.get("forecast")', source)
+        self.assertIn('data.get("risk_assessment")', source)
+        self.assertNotIn('data.get("risk_prediction")', source)
 
 
 if __name__ == "__main__":

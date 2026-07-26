@@ -116,21 +116,54 @@ class SteamSkinOpsPlugin(Star):
                 f"T+7 历史：{data.get('t7_sample_count', 0)} 点 / {data.get('t7_span_days', 0)} 天"
                 f"（{'充足' if data.get('t7_sufficient') else '不足'}）",
             ])
-        risk = data.get("risk_prediction") or {}
-        if risk.get("status") == "ready":
-            level = {"low": "低", "medium": "中", "high": "高"}.get(
-                risk.get("level"), "未知"
+        forecast = data.get("forecast") or {}
+        if forecast.get("status") == "ready":
+            forecast_ratio = forecast.get("forecast_balance_ratio")
+            ratio_text = (
+                f"{float(forecast_ratio):.2%}"
+                if forecast_ratio is not None else "不可用"
             )
             lines.append(
-                f"T+7 风险预测：{level}风险｜风险比例 "
-                f"{float(risk['risk_ratio']):.2%}｜预测到手 "
-                f"¥{float(risk['forecast_steam_net_t7']):.2f}"
+                f"七日预测：¥{float(forecast['predicted_steam_net']):.2f}"
+                f"（{float(forecast['change_pct']) / 100:+.1%}）"
+            )
+            window = int(forecast.get("window_days") or 0)
+            window_text = f"{window} 日" if window else ""
+            confidence = "正常" if forecast.get("confidence") == "normal" else "低"
+            lines.extend([
+                f"预测模式：{window_text}{forecast.get('mode_label') or '未知'}"
+                f"（{confidence}置信度）",
+                f"预测倒余额比例：{ratio_text}",
+            ])
+        else:
+            reason = (forecast.get("reasons") or ["历史或当前行情不足"])[0]
+            lines.append(f"七日预测：不可用（{reason}）")
+
+        risk = data.get("risk_assessment") or {}
+        if risk.get("status") == "ready":
+            level_text = {"low": "低", "medium": "中", "high": "高"}
+            dimensions = risk.get("dimensions") or {}
+            dimension_labels = {
+                "price": "价格", "volatility": "波动",
+                "inventory": "库存", "volume": "成交量",
+            }
+            detail = "、".join(
+                f"{label}{level_text.get((dimensions.get(key) or {}).get('level'), '未知')}"
+                for key, label in dimension_labels.items()
+            )
+            lines.append(
+                f"风险评估：总体{level_text.get(risk.get('overall_level'), '未知')}"
+                f"｜{detail}"
+            )
+            risk_ratio = risk.get("risk_balance_ratio")
+            lines.append(
+                f"风险倒余额比例：{float(risk_ratio):.2%}"
+                if risk_ratio is not None else "风险倒余额比例：不可用"
             )
             for reason in (risk.get("reasons") or [])[:3]:
                 lines.append(f"- {reason}")
         else:
-            reason = (risk.get("reasons") or ["历史或当前行情不足"])[0]
-            lines.append(f"T+7 风险预测：不可用（{reason}）")
+            lines.append("风险评估：不可用")
         lines.extend([
             f"数据更新时间：{source_time}", f"SMIS：{data['links']['smis']}",
             f"Steam：{data['links']['steam']}",

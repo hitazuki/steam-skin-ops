@@ -362,6 +362,8 @@ alerts:
         result = manager.quote("1579")
         self.assertTrue(result["stale"])
         self.assertIn("实时刷新失败", result["warning"])
+        self.assertEqual(result["forecast"]["status"], "stale")
+        self.assertEqual(result["risk_assessment"]["status"], "unavailable")
 
     def test_ratio_rules_are_session_isolated_and_rearm_after_three_percent_margin(self):
         notifier = FakeNotifier()
@@ -406,7 +408,8 @@ alerts:
         self.assertIn("最低平台：", breakthrough)
         self.assertIn("Steam 预计到手：", breakthrough)
         self.assertIn("7 日 Steam 到手 P25：", breakthrough)
-        self.assertIn("风险预测：", breakthrough)
+        self.assertIn("七日预测：", breakthrough)
+        self.assertIn("风险评估：", breakthrough)
         self.assertIn("https://smis.club/commodity/1579", breakthrough)
         self.assertIn("https://steamcommunity.com/market/listings/730/", breakthrough)
         self.assertEqual(self.storage.get_rule_state(rule["id"])["highest_notified_level"], 1)
@@ -417,6 +420,32 @@ alerts:
         self.assertEqual(manager._breakthrough_level("t7", 0.72, 0.6984)[0], 1)
         self.assertEqual(manager._breakthrough_level("platform", 100, 97)[0], 1)
         self.assertEqual(manager._breakthrough_level("steam", 100, 106)[0], 2)
+
+    def test_ready_analysis_message_separates_forecast_and_risk_ratios(self):
+        forecast = {
+            "status": "ready", "predicted_steam_net": 4.42,
+            "change_pct": -5.4, "forecast_balance_ratio": 0.7217,
+            "window_days": 21, "mode_label": "稳健对数趋势",
+            "confidence": "normal",
+        }
+        risk = {
+            "status": "ready", "overall_level": "high",
+            "risk_balance_ratio": 0.7384,
+            "dimensions": {
+                "price": {"level": "high"},
+                "volatility": {"level": "medium"},
+                "inventory": {"level": "high"},
+                "volume": {"level": "medium"},
+            },
+            "reasons": ["预计七日下跌 5.4%"],
+        }
+
+        lines = self.manager()._analysis_reference_lines(forecast, risk)
+        content = "\n".join(lines)
+
+        self.assertIn("预测倒余额比例 72.17%", content)
+        self.assertIn("风险倒余额比例 73.84%", content)
+        self.assertIn("价格高、波动中、库存高、成交量中", content)
 
     def test_daily_summary_groups_active_rules_once_per_day(self):
         notifier = FakeNotifier()
@@ -430,7 +459,8 @@ alerts:
         manager.dispatch_outbox()
         self.assertEqual(len(notifier.messages), 1)
         self.assertIn("共 2 条", notifier.messages[0][2])
-        self.assertIn("风险预测", notifier.messages[0][2])
+        self.assertIn("预测", notifier.messages[0][2])
+        self.assertIn("风险", notifier.messages[0][2])
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
         manager.dispatch_outbox()
         self.assertEqual(len(notifier.messages), 1)
@@ -575,7 +605,10 @@ alerts:
                 "/v2/market/quote", headers=headers, params={"q": "1579"}
             )
             self.assertTrue(quote_response.json()["ok"])
-            self.assertIn("risk_prediction", quote_response.json()["data"])
+            quote_data = quote_response.json()["data"]
+            self.assertIn("forecast", quote_data)
+            self.assertIn("risk_assessment", quote_data)
+            self.assertNotIn("risk_prediction", quote_data)
             bad = client.patch(f"/v2/rules/{rule_id}", headers=headers, json={
                 "recipient_key": "astrQQ:FriendMessage:test", "threshold": 0,
             })
