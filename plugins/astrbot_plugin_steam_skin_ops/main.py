@@ -84,7 +84,7 @@ class SteamSkinOpsPlugin(Star):
             pass
         lines = [
             f"{data['name_zh']} / {data['name']}  [SMIS {data['smis_id']}]",
-            f"即时挂刀比例：{ratio_text} {marker}",
+            f"即时倒余额比例：{ratio_text} {marker}",
         ]
         lowest = data.get("lowest_platform")
         platforms = data.get("platforms") or []
@@ -108,14 +108,16 @@ class SteamSkinOpsPlugin(Star):
             f"Steam 日成交量：{data.get('steam_transaction_quantity') or 0}",
         ])
         if data.get("t7_steam_net_p25") is not None:
-            platform_price = float((lowest or {}).get("sell_price") or 0)
-            t7_ratio = platform_price / float(data["t7_steam_net_p25"]) if platform_price else None
-            lines.extend([
-                f"7 日 Steam 到手 P25：¥{float(data['t7_steam_net_p25']):.2f}",
-                f"T+7 保守比例：{t7_ratio:.2%}" if t7_ratio is not None else "T+7 保守比例：未知",
-                f"T+7 历史：{data.get('t7_sample_count', 0)} 点 / {data.get('t7_span_days', 0)} 天"
-                f"（{'充足' if data.get('t7_sufficient') else '不足'}）",
-            ])
+            history_label = (
+                "七日历史基准" if data.get("t7_sufficient")
+                else "七日历史参考（样本不足）"
+            )
+            lines.append(
+                f"{history_label}：Steam 到手 P25 "
+                f"¥{float(data['t7_steam_net_p25']):.2f}"
+                f"（{data.get('t7_sample_count', 0)} 点 / "
+                f"{data.get('t7_span_days', 0)} 天）"
+            )
         forecast = data.get("forecast") or {}
         if forecast.get("status") == "ready":
             forecast_ratio = forecast.get("forecast_balance_ratio")
@@ -147,19 +149,49 @@ class SteamSkinOpsPlugin(Star):
                 "price": "价格", "volatility": "波动",
                 "inventory": "库存", "volume": "成交量",
             }
-            detail = "、".join(
-                f"{label}{level_text.get((dimensions.get(key) or {}).get('level'), '未知')}"
-                for key, label in dimension_labels.items()
-            )
+            detail_parts = []
+            for key, label in dimension_labels.items():
+                dimension = dimensions.get(key) or {}
+                dimension_level = level_text.get(dimension.get("level"), "不可用")
+                detail_parts.append(f"{label}{dimension_level}")
+            detail = "、".join(detail_parts)
+            risk_confidence = "正常" if risk.get("confidence") == "normal" else "低"
             lines.append(
                 f"风险评估：总体{level_text.get(risk.get('overall_level'), '未知')}"
-                f"｜{detail}"
+                f"（{risk_confidence}置信度）｜{detail}"
             )
             risk_ratio = risk.get("risk_balance_ratio")
-            lines.append(
-                f"风险倒余额比例：{float(risk_ratio):.2%}"
-                if risk_ratio is not None else "风险倒余额比例：不可用"
-            )
+            risk_net = risk.get("risk_steam_net")
+            current_net = data.get("steam_net")
+            forecast_net = forecast.get("predicted_steam_net")
+            history_p25 = data.get("t7_steam_net_p25")
+
+            def same_display_price(left: object, right: object) -> bool:
+                if left is None or right is None:
+                    return False
+                return round(float(left), 2) == round(float(right), 2)
+
+            if risk_ratio is None:
+                lines.append("风险倒余额比例：不可用")
+            elif same_display_price(risk_net, current_net):
+                lines.append("风险倒余额比例：同即时比例（当前到手价为风险底价）")
+            elif forecast.get("status") == "ready" and same_display_price(
+                risk_net, forecast_net
+            ):
+                lines.append("风险倒余额比例：同预测比例（七日预测价为风险底价）")
+            elif same_display_price(risk_net, history_p25):
+                lines.append(
+                    f"风险倒余额比例：{float(risk_ratio):.2%}"
+                    "（七日历史 P25 为风险底价）"
+                )
+            else:
+                risk_net_text = (
+                    f"（风险底价 ¥{float(risk_net):.2f}）"
+                    if risk_net is not None else ""
+                )
+                lines.append(
+                    f"风险倒余额比例：{float(risk_ratio):.2%}{risk_net_text}"
+                )
             for reason in (risk.get("reasons") or [])[:3]:
                 lines.append(f"- {reason}")
         else:

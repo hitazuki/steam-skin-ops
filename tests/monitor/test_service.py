@@ -407,7 +407,7 @@ alerts:
         breakthrough = notifier.messages[1][2]
         self.assertIn("最低平台：", breakthrough)
         self.assertIn("Steam 预计到手：", breakthrough)
-        self.assertIn("7 日 Steam 到手 P25：", breakthrough)
+        self.assertIn("七日历史基准：", breakthrough)
         self.assertIn("七日预测：", breakthrough)
         self.assertIn("风险评估：", breakthrough)
         self.assertIn("https://smis.club/commodity/1579", breakthrough)
@@ -430,6 +430,7 @@ alerts:
         }
         risk = {
             "status": "ready", "overall_level": "high",
+            "confidence": "normal",
             "risk_balance_ratio": 0.7384,
             "dimensions": {
                 "price": {"level": "high"},
@@ -444,8 +445,42 @@ alerts:
         content = "\n".join(lines)
 
         self.assertIn("预测倒余额比例 72.17%", content)
-        self.assertIn("风险倒余额比例 73.84%", content)
+        self.assertIn("风险倒余额比例：73.84%", content)
         self.assertIn("价格高、波动中、库存高、成交量中", content)
+
+    def test_analysis_message_deduplicates_risk_ratio_by_floor_source(self):
+        forecast = {
+            "status": "ready", "predicted_steam_net": 4.42,
+            "change_pct": -5.4, "forecast_balance_ratio": 0.7217,
+            "window_days": 21, "mode_label": "稳健对数趋势",
+            "confidence": "normal",
+        }
+        risk = {
+            "status": "ready", "overall_level": "high", "confidence": "normal",
+            "risk_steam_net": 4.67, "risk_balance_ratio": 0.6831,
+            "dimensions": {
+                key: {"level": "low"}
+                for key in ("price", "volatility", "inventory", "volume")
+            },
+            "reasons": [],
+        }
+
+        current_lines = self.manager()._analysis_reference_lines(
+            forecast, risk, current_steam_net=4.67, t7_steam_net_p25=4.60,
+        )
+        self.assertIn(
+            "风险倒余额比例：同即时比例（当前到手价为风险底价）",
+            current_lines,
+        )
+
+        risk.update({"risk_steam_net": 4.42, "risk_balance_ratio": 0.7217})
+        forecast_lines = self.manager()._analysis_reference_lines(
+            forecast, risk, current_steam_net=4.67, t7_steam_net_p25=4.60,
+        )
+        self.assertIn(
+            "风险倒余额比例：同预测比例（七日预测价为风险底价）",
+            forecast_lines,
+        )
 
     def test_daily_summary_groups_active_rules_once_per_day(self):
         notifier = FakeNotifier()

@@ -577,7 +577,7 @@ class MonitoringManager:
     ) -> tuple[str, str]:
         rule_type = str(rule["rule_type"])
         labels = {
-            "ratio": "即时比例", "t7": "T+7 保守比例",
+            "ratio": "即时比例", "t7": "七日历史 P25 比例",
             "platform": "最低平台价", "steam": "Steam 售价",
         }
         value_text = f"{value:.2%}" if rule_type in {"ratio", "t7"} else f"¥{value:.2f}"
@@ -701,7 +701,11 @@ class MonitoringManager:
         )
 
     @classmethod
-    def _analysis_reference_lines(cls, forecast: dict, risk: dict) -> list[str]:
+    def _analysis_reference_lines(
+        cls, forecast: dict, risk: dict, *,
+        current_steam_net: float | None = None,
+        t7_steam_net_p25: float | None = None,
+    ) -> list[str]:
         lines: list[str] = []
         if forecast.get("status") == "ready":
             ratio = forecast.get("forecast_balance_ratio")
@@ -722,16 +726,45 @@ class MonitoringManager:
         if risk.get("status") == "ready":
             dimensions = risk.get("dimensions") or {}
             labels = {"price": "价格", "volatility": "波动", "inventory": "库存", "volume": "成交量"}
-            dimension_text = "、".join(
-                f"{labels[key]}{cls._level_text((dimensions.get(key) or {}).get('level'))}"
-                for key in labels
-            )
+            dimension_parts = []
+            for key in labels:
+                level = (dimensions.get(key) or {}).get("level")
+                level_text = "不可用" if level in {None, "unknown"} else cls._level_text(level)
+                dimension_parts.append(f"{labels[key]}{level_text}")
+            dimension_text = "、".join(dimension_parts)
             ratio = risk.get("risk_balance_ratio")
-            ratio_text = f"{float(ratio):.2%}" if ratio is not None else "不可用"
+            confidence = "正常" if risk.get("confidence") == "normal" else "低"
             lines.append(
                 f"风险评估：总体{cls._level_text(risk.get('overall_level'))}"
-                f"｜{dimension_text}｜风险倒余额比例 {ratio_text}"
+                f"（{confidence}置信度）｜{dimension_text}"
             )
+            risk_net = risk.get("risk_steam_net")
+            forecast_net = forecast.get("predicted_steam_net")
+
+            def same_display_price(left: object, right: object) -> bool:
+                if left is None or right is None:
+                    return False
+                return round(float(left), 2) == round(float(right), 2)
+
+            if ratio is None:
+                lines.append("风险倒余额比例：不可用")
+            elif same_display_price(risk_net, current_steam_net):
+                lines.append("风险倒余额比例：同即时比例（当前到手价为风险底价）")
+            elif forecast.get("status") == "ready" and same_display_price(
+                risk_net, forecast_net
+            ):
+                lines.append("风险倒余额比例：同预测比例（七日预测价为风险底价）")
+            elif same_display_price(risk_net, t7_steam_net_p25):
+                lines.append(
+                    f"风险倒余额比例：{float(ratio):.2%}"
+                    "（七日历史 P25 为风险底价）"
+                )
+            else:
+                risk_net_text = (
+                    f"（风险底价 ¥{float(risk_net):.2f}）"
+                    if risk_net is not None else ""
+                )
+                lines.append(f"风险倒余额比例：{float(ratio):.2%}{risk_net_text}")
             reasons = risk.get("reasons") or []
             if reasons:
                 lines.append(f"风险说明：{'；'.join(str(reason) for reason in reasons[:3])}")
@@ -756,7 +789,15 @@ class MonitoringManager:
             risk_ratio = risk.get("risk_balance_ratio")
             risk_text = f"风险{cls._level_text(risk.get('overall_level'))}"
             if risk_ratio is not None:
-                risk_text += f"/{float(risk_ratio):.2%}"
+                forecast_ratio = forecast.get("forecast_balance_ratio")
+                if (
+                    forecast.get("status") == "ready"
+                    and forecast_ratio is not None
+                    and f"{float(risk_ratio):.2%}" == f"{float(forecast_ratio):.2%}"
+                ):
+                    risk_text += "/同预测比例"
+                else:
+                    risk_text += f"/{float(risk_ratio):.2%}"
         else:
             risk_text = "风险不可用"
         mode_suffix = f"({mode_text})" if mode_text else ""
@@ -777,12 +818,20 @@ class MonitoringManager:
             f"Steam 在售/日成交：{snapshot.steam_sell_num or 0}/{snapshot.steam_transaction_quantity or 0}",
         ])
         if stats.get("t7_steam_net_p25") is not None:
-            lines.extend([
-                f"7 日 Steam 到手最低：¥{stats['t7_steam_net_low']:.2f}",
-                f"7 日 Steam 到手 P25：¥{stats['t7_steam_net_p25']:.2f}",
-                f"7 日 Steam 到手中位数：¥{stats['t7_steam_net_median']:.2f}",
-            ])
-        lines.extend(cls._analysis_reference_lines(forecast, risk))
+            history_label = (
+                "七日历史基准" if stats.get("t7_sufficient")
+                else "七日历史参考（样本不足）"
+            )
+            lines.append(
+                f"{history_label}：到手最低 ¥{stats['t7_steam_net_low']:.2f}｜"
+                f"P25 ¥{stats['t7_steam_net_p25']:.2f}｜"
+                f"中位 ¥{stats['t7_steam_net_median']:.2f}"
+            )
+        lines.extend(cls._analysis_reference_lines(
+            forecast, risk,
+            current_steam_net=snapshot.steam_net,
+            t7_steam_net_p25=stats.get("t7_steam_net_p25"),
+        ))
         lines.extend([
             f"数据更新时间：{snapshot.source_updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
             f"SMIS：https://smis.club/commodity/{snapshot.smis_id}",
@@ -797,7 +846,7 @@ class MonitoringManager:
     ) -> tuple[str, str]:
         labels = {
             "ratio": ("【即时挂刀】", "即时比例"),
-            "t7": ("【T+7挂刀】", "T+7 保守比例"),
+            "t7": ("【T+7挂刀】", "七日历史 P25 比例"),
             "platform": ("【平台到价】", "最低平台价"),
             "steam": ("【Steam清仓】", "Steam 售价"),
         }
