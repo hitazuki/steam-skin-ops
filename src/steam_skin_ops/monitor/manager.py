@@ -70,6 +70,7 @@ class MonitoringManager:
         self.breakthrough_step = float(breakthrough_step_percent) / 100
         self._locks_guard = threading.Lock()
         self._item_locks: dict[int, threading.Lock] = {}
+        self._dispatch_lock = threading.Lock()
         self._sync_breakthrough_step()
 
     def _sync_breakthrough_step(self) -> None:
@@ -863,18 +864,19 @@ class MonitoringManager:
         return f"{prefix}{snapshot.name_zh} {value_text}", "\n".join(lines)
 
     def dispatch_outbox(self) -> dict[str, int]:
-        sent = failed = 0
-        for message in self.storage.due_notifications():
-            result = self.notifier.send_to(
-                message["recipient_key"], message["title"], message["content"]
-            )
-            if result.success:
-                self.storage.mark_notification_sent(message["id"])
-                sent += 1
-            else:
-                self.storage.mark_notification_failed(message["id"], result.message)
-                failed += 1
-        return {"sent": sent, "failed": failed}
+        with self._dispatch_lock:
+            sent = failed = 0
+            for message in self.storage.due_notifications():
+                result = self.notifier.send_to(
+                    message["recipient_key"], message["title"], message["content"]
+                )
+                if result.success:
+                    self.storage.mark_notification_sent(message["id"])
+                    sent += 1
+                else:
+                    self.storage.mark_notification_failed(message["id"], result.message)
+                    failed += 1
+            return {"sent": sent, "failed": failed}
 
     def run_cycle(self, max_workers: int = 4) -> list[dict]:
         active_ids = {int(rule["smis_id"]) for rule in self.storage.list_rules()}

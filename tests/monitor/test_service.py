@@ -1,6 +1,7 @@
 import unittest
 import sqlite3
 import json
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -520,7 +521,7 @@ alerts:
 
         self.assertEqual(manager.enqueue_daily_summary(date(2026, 7, 25)), 0)
 
-    def test_runtime_sends_summary_at_first_cycle_after_beijing_nine(self):
+    def test_runtime_daily_summary_is_independent_of_poll_cycle(self):
         notifier = FakeNotifier()
         manager = self.manager([0.70], notifier)
         self.storage.add_rule(1579, "umo:a", "ratio", 72)
@@ -533,8 +534,56 @@ alerts:
         notifier.messages.clear()
         runtime.run_once(datetime(2026, 7, 25, 1, 0, tzinfo=timezone.utc))
 
+        self.assertEqual(len(notifier.messages), 0)
+
+        result = runtime.run_daily_summary(
+            datetime(2026, 7, 25, 1, 0, tzinfo=timezone.utc)
+        )
+
         self.assertEqual(len(notifier.messages), 1)
         self.assertIn("每日交易告警汇总", notifier.messages[0][1])
+        self.assertEqual(result, {"queued": 1, "sent": 1, "failed": 0})
+        self.assertTrue(runtime.last_daily_summary_ok)
+
+    def test_runtime_daily_scheduler_targets_beijing_nine_and_catches_up(self):
+        runtime = ServiceRuntime(
+            self.manager(), backup_dir=Path(self.tmp.name) / "backups",
+            daily_summary_time="09:00",
+        )
+
+        before = datetime(2026, 7, 25, 0, 59, tzinfo=timezone.utc)
+        target = runtime._next_daily_summary_target(before)
+        self.assertEqual(target.astimezone(timezone.utc), datetime(
+            2026, 7, 25, 1, 0, tzinfo=timezone.utc
+        ))
+
+        after = datetime(2026, 7, 25, 1, 26, tzinfo=timezone.utc)
+        catch_up = runtime._next_daily_summary_target(after)
+        self.assertEqual(catch_up, after.astimezone(runtime.local_timezone))
+
+        self.storage.set_metadata("daily_summary:last_date", "2026-07-25")
+        next_day = runtime._next_daily_summary_target(after)
+        self.assertEqual(next_day.astimezone(timezone.utc), datetime(
+            2026, 7, 26, 1, 0, tzinfo=timezone.utc
+        ))
+
+    def test_runtime_starts_and_stops_both_schedulers(self):
+        runtime = ServiceRuntime(
+            self.manager(), interval_seconds=3600,
+            backup_dir=Path(self.tmp.name) / "backups",
+            daily_summary_time="23:59",
+        )
+
+        runtime.start()
+        try:
+            status = runtime.status()
+            self.assertTrue(status["running"])
+            self.assertTrue(status["daily_summary_running"])
+        finally:
+            runtime.stop()
+
+        self.assertFalse(runtime.thread.is_alive())
+        self.assertFalse(runtime.summary_thread.is_alive())
 
     def test_breakthrough_step_and_daily_time_are_validated(self):
         with self.assertRaisesRegex(ValueError, "突破档位步长"):
@@ -589,6 +638,38 @@ alerts:
         result = manager.dispatch_outbox()
         self.assertEqual(result, {"sent": 1, "failed": 1})
         self.assertEqual(self.storage.outbox_counts(), {"pending": 1, "sent": 1})
+
+    def test_concurrent_outbox_dispatch_sends_each_job_once(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingNotifier(FakeNotifier):
+            def send_to(self, umo, title, content):
+                entered.set()
+                release.wait(timeout=2)
+                return super().send_to(umo, title, content)
+
+        notifier = BlockingNotifier()
+        manager = self.manager(notifier=notifier)
+        self.storage.enqueue_notification(
+            "concurrent:1", "umo:a", "test", "title", "content",
+            driver=notifier.name,
+        )
+        results = []
+        first = threading.Thread(target=lambda: results.append(manager.dispatch_outbox()))
+        second = threading.Thread(target=lambda: results.append(manager.dispatch_outbox()))
+
+        first.start()
+        self.assertTrue(entered.wait(timeout=2))
+        second.start()
+        release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertEqual(sum(result["sent"] for result in results), 1)
 
     def test_stale_source_time_does_not_trigger_health_failure(self):
         notifier = FakeNotifier()

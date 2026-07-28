@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "steam-skin-ops"
-version = "3.0.0"
+version = "3.0.1"
 description = "Steam skin profit analytics and standalone market monitoring"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
